@@ -4,7 +4,7 @@ Last updated: 2026-07-24
 
 Status: Active development
 
-Current milestone: The complete-response flow has a minimal, mocked pytest baseline. Amazon automation has not started.
+Current milestone: The complete-response flow and an isolated SQLite key/value memory layer have verified pytest coverage. Amazon automation has not started.
 
 This document is the current source of truth for starting a new project conversation. It describes the repository as it exists now, not historical implementation details.
 
@@ -45,6 +45,8 @@ LM Studio successfully loads the selected model. Its OpenAI-compatible local API
 
 The OpenAI Python SDK is used only as a client for LM Studio's OpenAI-compatible local API. This project does not use it as an OpenAI cloud-model dependency.
 
+`memory.py` is an independent local storage boundary and is not yet called by `agent.py`.
+
 ## 4. Exact Current Module Responsibilities
 
 ### `src/main.py` — Telegram boundary and startup
@@ -72,6 +74,14 @@ The OpenAI Python SDK is used only as a client for LM Studio's OpenAI-compatible
 - Returns stripped visible `message.content` only; reasoning fields are not shown to Telegram users.
 - Raises a clear error for missing or whitespace-only visible model output.
 
+### `src/memory.py` — local memory storage boundary
+
+- Uses Python's built-in `sqlite3` module for simple string key/value storage.
+- Provides `remember()`, `recall()`, and `forget()`.
+- Defaults to `data/memory.db`, while accepting a database-path argument for isolated use and tests.
+- Creates and queries its SQLite table internally; no other module contains its SQL or setup details.
+- Is deliberately not integrated into the agent workflow yet.
+
 ## 5. Current Repository Structure
 
 ### Verified files and directories
@@ -91,18 +101,20 @@ amazon-agent/
 ├── src/
 │   ├── main.py
 │   ├── agent.py
-│   └── llm_client.py
+│   ├── llm_client.py
+│   └── memory.py
 ├── config/                    # Present; no tracked project files verified inside
 ├── data/                      # Present; no tracked project files verified inside
 └── tests/
-    └── test_complete_response_flow.py
+    ├── test_complete_response_flow.py
+    └── test_memory.py
 ```
 
 `requirements-dev.txt` is the current development dependency manifest. No production dependency manifest was found (`requirements.txt`, `pyproject.toml`, `Pipfile`, `poetry.lock`, and `uv.lock` are absent).
 
 ### Planned but not implemented
 
-- Persistent memory and preference storage.
+- Memory use by the agent and preference-storage design.
 - Amazon search, product evaluation, browser automation, and purchase execution.
 - Configuration validation at startup.
 - A production dependency manifest.
@@ -152,9 +164,10 @@ Streaming is not part of the current implementation. Temporary streaming diagnos
 - A direct, non-mocked call to `generate_response()` passed against LM Studio on 2026-07-24 and returned 17 non-empty visible characters. The request used the configured local endpoint and did not expose response content or reasoning fields.
 - The current source was inspected on 2026-07-24.
 - `tests/test_complete_response_flow.py` was added and verified with five mocked tests on 2026-07-24. It covers visible completed content, empty/whitespace model output, the friendly agent error, and long completed-response sectioning.
-- `.venv/bin/python -m pytest` passed: 5 passed in 0.47s on 2026-07-24.
-- `.venv/bin/python -m py_compile src/main.py src/agent.py src/llm_client.py` passed on 2026-07-24.
-- `PYTHONPATH=src .venv/bin/python -c 'import main, agent, llm_client'` passed on 2026-07-24.
+- `tests/test_memory.py` was added and verified with six temporary-database tests on 2026-07-24. It covers storing and recalling values, updates, missing-key recall, forgetting existing and missing keys, and persistence across separate SQLite connections.
+- `.venv/bin/python -m pytest` passed: 11 passed in 1.70s on 2026-07-24.
+- `.venv/bin/python -m py_compile src/main.py src/agent.py src/llm_client.py src/memory.py` passed on 2026-07-24.
+- `PYTHONPATH=src .venv/bin/python -c "import main, agent, llm_client, memory"` passed on 2026-07-24.
 - The virtual environment and installed package versions listed above were inspected on 2026-07-24.
 
 ## 10. Known Limitations and Risks
@@ -165,14 +178,14 @@ Streaming is not part of the current implementation. Temporary streaming diagnos
 - `requirements-dev.txt` pins pytest only; production dependency installation is not yet reproducible from a manifest.
 - Missing or malformed environment variables do not yet receive explicit startup validation.
 - Telegram/network/API failures around placeholder edits are not yet given dedicated retry handling.
-- The current model response path has no conversation memory, tool use, product search, or purchase capability.
+- The current model response path does not yet use the isolated memory layer and has no conversation history, tool use, product search, or purchase capability.
 - Any future purchasing workflow is financially consequential and requires explicit safety, confirmation, audit, and authorization design before implementation.
 
 ## 11. Current Roadmap
 
 1. Add configuration validation and reproducible startup hardening.
 2. Create a production dependency manifest after the startup configuration contract is defined.
-3. Add a minimal memory/preferences design.
+3. Deliberately select a checkpoint to integrate the existing minimal memory layer or extend preference storage.
 4. Build read-only Amazon search and recommendation capabilities.
 5. Add confirmation, audit, price-limit, and duplicate-prevention safeguards.
 6. Consider browser automation and purchase execution only after the earlier safety stages are verified.

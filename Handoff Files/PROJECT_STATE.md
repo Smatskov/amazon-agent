@@ -149,6 +149,7 @@ Streaming is not part of the current implementation. Temporary streaming diagnos
 - The model identifier `qwen3.5-4b-mlx` was verified.
 - Telegram-to-local-model-to-Telegram inference was verified end to end.
 - The complete-response Telegram behavior was tested successfully through Telegram on 2026-07-24.
+- A direct, non-mocked call to `generate_response()` passed against LM Studio on 2026-07-24 and returned 17 non-empty visible characters. The request used the configured local endpoint and did not expose response content or reasoning fields.
 - The current source was inspected on 2026-07-24.
 - `tests/test_complete_response_flow.py` was added and verified with five mocked tests on 2026-07-24. It covers visible completed content, empty/whitespace model output, the friendly agent error, and long completed-response sectioning.
 - `.venv/bin/python -m pytest` passed: 5 passed in 0.47s on 2026-07-24.

@@ -577,3 +577,184 @@ The current complete-response flow can be verified quickly and repeatably withou
 Consequences:
 
 `requirements-dev.txt` pins pytest for development, and tests exercise the language-model response handling, agent fallback, and completed-response Telegram sectioning in isolation.
+
+---
+
+## ADR-021 — Separate Purchase History From User Preferences
+
+Status: Accepted for roadmap; not yet implemented
+
+Decision:
+
+Purchase history and user preferences are separate concepts and must remain separate in the data model.
+
+Only successfully completed orders enter purchase history.
+
+A purchase does not automatically create or update a preference.
+
+Preference inference must not be introduced without explicit, transparent, reviewable rules.
+
+Context:
+
+A product may be purchased as a gift, experiment, one-time need, or because of price or availability. Adding a product to a cart or attempting checkout does not prove a purchase occurred. Treating purchases as preferences would create inaccurate personalization and unsafe future automation.
+
+Reasoning:
+
+- Improves accuracy by preserving the distinction between recorded transactions and user intent.
+- Supports auditability of completed orders and later decisions that use them.
+- Enables duplicate prevention without incorrectly treating a prior order as a preference.
+- Makes reorder behavior trustworthy by consulting purchase history without claiming preference.
+- Makes correction and deletion easier because each data type has a distinct purpose and lifecycle.
+- Creates safer future automation by avoiding unreviewed preference inference.
+- Provides clearer data ownership and responsibility between preference storage and purchase-history storage.
+
+Tradeoffs:
+
+- Requires more data structures.
+- Requires more explicit lifecycle handling.
+- Completed-order confirmation must be reliable.
+- Preference learning becomes slower and more conservative.
+
+Consequences:
+
+- Future Amazon automation must emit a verified completed-order event before purchase history is written.
+- Failed, abandoned, cancelled, and cart-only states must not be written as purchases.
+- Preference storage and purchase-history storage must be independently inspectable and editable.
+- Future reorder logic may consult purchase history without claiming the user prefers the product.
+- Any future preference-learning policy requires a separate ADR or explicit policy decision.
+
+---
+
+## ADR-022 — Isolate Amazon Automation Behind a Dedicated Tool Boundary
+
+Status: Accepted and implemented for read-only search
+
+Decision:
+
+Amazon automation remains isolated behind a dedicated tool boundary.
+
+`src/amazon.py` owns every Amazon and Playwright interaction. `agent.py` may call its explicit interfaces and consume structured results, but it does not control browser details. `main.py` remains Telegram-only, and `llm_client.py` remains LM Studio-only.
+
+Context:
+
+Amazon browsing is operationally fragile and financially consequential once it progresses beyond search. Browser selectors, bot challenges, authentication, and order state must not leak into agent reasoning or Telegram handling.
+
+Reasoning:
+
+- Keeps browser behavior replaceable and independently testable.
+- Prevents browser details from coupling to model communication or Telegram handling.
+- Makes the read-only search capability a narrow, auditable first stage of the purchasing-safety roadmap.
+- Creates a clear location for future safeguards around login, cart, checkout, confirmation, and completed-order events.
+
+Tradeoffs:
+
+- Adds an integration boundary and structured result conversion.
+- Browser failures must be handled separately from model failures.
+- Future Amazon operations require explicit interfaces rather than direct agent access to browser internals.
+
+Consequences:
+
+- The initial interface is async `search_products(query: str)`, returning up to five structured `Product` records from public Amazon search results.
+- The initial implementation does not log in, add items to a cart, begin checkout, purchase, scrape reviews, or store purchase history.
+- Future financially consequential operations must be introduced as narrowly scoped tool interfaces with their required safety controls; they must not be added to the read-only search function.
+
+---
+
+## ADR-023 — LLMs Evaluate Products but Do Not Discover Products
+
+Status: Accepted and implemented for read-only search evaluation
+
+Decision:
+
+Amazon is the source of product facts. The evaluator receives structured product data only. The LLM is responsible for reasoning, ranking, and explanation; it must not hallucinate missing product facts.
+
+Context:
+
+The initial Amazon tool can retrieve a limited, explicit set of public search-result fields. A language model can compare those records in natural language, but it cannot reliably discover facts that Amazon did not supply.
+
+Reasoning:
+
+- Separates factual discovery from recommendation reasoning.
+- Keeps Amazon interaction in the dedicated browser-tool boundary.
+- Makes the data available to the model explicit and auditable.
+- Reduces misleading recommendations based on invented specifications, availability, prices, ratings, reviews, or Prime eligibility.
+
+Tradeoffs:
+
+- Recommendations are limited by the narrow initial product schema.
+- Missing facts may prevent a confident recommendation or budget alternative.
+- Prompt instructions reduce, but cannot fully eliminate, model hallucination.
+
+Consequences:
+
+- `product_evaluator.py` accepts `Product` records and the original user request, then calls only `llm_client.generate_response()`.
+- The evaluator prompt directs the model to use only structured fields, explain tradeoffs, recommend a top choice, and offer a budget alternative only when appropriate.
+- The evaluator must not call Amazon, Playwright, Telegram, or storage.
+- Future product-fact expansion belongs in the Amazon data boundary; future ranking-policy changes should be made explicitly and remain reviewable.
+
+---
+
+## ADR-024 — Carry Explicit Request Context Through Product Evaluation
+
+Status: Accepted and implemented for read-only search
+
+Decision:
+
+Use an immutable `RequestContext` to carry request-level facts from orchestration to product evaluation. The evaluator returns an `EvaluationResult` that keeps recommendation text separate from metadata reserved for future workflows.
+
+Context:
+
+Read-only product evaluation already needs the original request and search query. Future reorder, confirmation, duplicate-prevention, and purchase-history workflows will need additional request facts, but none may be inferred into action today.
+
+Reasoning:
+
+- Makes the data flowing into evaluation explicit and testable.
+- Avoids growing positional function arguments as future workflow stages are designed.
+- Allows reorder-style wording to be recorded as metadata without granting order-history access or changing Telegram output.
+- Keeps future financially consequential data separate from the current read-only search behavior.
+
+Tradeoffs:
+
+- Adds small context and result types for a currently narrow flow.
+- Requires callers to populate only facts they actually know.
+- Reorder metadata remains intentionally limited and cannot substitute for verified order history.
+
+Consequences:
+
+- The search route populates only current request, intent, search-query, and confidence fields; the future order-history candidate remains unset.
+- The evaluator may flag clear reorder wording in `EvaluationResult`, but it must not access Amazon order history, invent products, or alter user-visible behavior.
+- Future reorder, purchase-history, preference-inference, and duplicate-order work requires separate policy and safety decisions before implementation.
+
+---
+
+## ADR-025 — Intent Classification Is Separate From Tool Execution
+
+Status: Accepted and implemented for current routing
+
+Decision:
+
+Intent classification determines user goals. Tool execution remains inside `agent.py`. Classifiers never directly invoke tools, and structured intent is validated before routing. Invalid classifications safely fall back to `general_chat`.
+
+Context:
+
+The agent now needs to accept natural-language memory and Amazon requests while preserving the existing explicit commands as aliases. A local language model can identify the likely request type, but it must not be trusted to perform actions or provide unvalidated tool input.
+
+Reasoning:
+
+- Keeps the classifier narrowly responsible for identifying what the user wants.
+- Keeps control of memory and Amazon operations in the orchestration boundary.
+- Makes model output inspectable and safely rejectable through strict JSON validation.
+- Preserves a safe fallback when LM Studio is unavailable, returns malformed data, or is not confident enough for an actionable route.
+
+Tradeoffs:
+
+- Natural-language requests add an LM Studio classification call before routing.
+- Entity extraction quality depends on the local model and must be manually verified.
+- Low-confidence requests may fall back to ordinary chat instead of taking a potentially useful action.
+
+Consequences:
+
+- `intent_classifier.py` returns only validated `IntentResult` metadata and has no tool, memory, Amazon, Telegram, or purchasing access.
+- `agent.py` routes validated memory and search intents to existing interfaces; it returns safe non-executing responses for buy and reorder intents.
+- Explicit `remember:`, `recall:`, `forget:`, and `search:` commands remain supported aliases.
+- Future classifier expansion must preserve validation and agent-owned execution boundaries.

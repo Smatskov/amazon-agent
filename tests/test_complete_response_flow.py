@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import agent
+import intent_classifier
 import llm_client
 import main
 
@@ -52,6 +53,11 @@ def test_agent_brain_returns_friendly_error_when_model_call_fails(monkeypatch):
         raise ConnectionError("LM Studio is unavailable")
 
     monkeypatch.setattr(agent, "generate_response", failing_generate_response)
+    monkeypatch.setattr(
+        agent.intent_classifier,
+        "classify_intent",
+        AsyncMock(return_value=intent_classifier.IntentResult("general_chat", 0.9, {})),
+    )
 
     response = asyncio.run(agent.agent_brain("Hello"))
 

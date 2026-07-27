@@ -6,6 +6,9 @@ from pathlib import Path
 
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parent.parent / "data" / "memory.db"
 
+# TODO: Record purchase history only after a verified successful checkout event.
+# TODO: Add preference inference only after an explicit, reviewable policy is adopted.
+
 
 def _connect(database_path: str | Path) -> sqlite3.Connection:
     """Open the memory database and ensure its key/value table exists."""

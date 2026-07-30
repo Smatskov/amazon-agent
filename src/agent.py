@@ -187,6 +187,7 @@ def _apply_workflow_reply(
     workflow: PurchaseWorkflow,
     reply: workflow_reply.WorkflowReply,
     workflow_database_path: str | Path,
+    message: str = "",
 ) -> str:
     """Execute an unambiguous reply without waiting for the local model."""
     if reply.intent is workflow_reply.ReplyIntent.CANCEL:
@@ -196,6 +197,8 @@ def _apply_workflow_reply(
         return _confirm_order(workflow, workflow_database_path)
     if reply.intent is workflow_reply.ReplyIntent.CHECKOUT:
         return _begin_checkout(workflow, workflow_database_path)
+    if reply.intent is workflow_reply.ReplyIntent.COMPARE:
+        return _resolve_or_research(workflow, message, workflow_database_path)
 
     if _is_awaiting_clarification(workflow):
         # A bare yes or no is not a product name, so the question still stands.
@@ -273,6 +276,56 @@ def _refine_candidates(
         removal_reasons=outcome.reasons,
         refined=True,
     )
+
+
+REQUEST_PREFIX = re.compile(
+    r"^(?:i\s+)?(?:need|want|would like|am looking for|looking for|get me|get|find me|find|"
+    r"show me|show|search for|search|buy me|buy|order|add)\s+", re.IGNORECASE
+)
+# Words that mean "act on what is already here", not "search for something new".
+NON_PRODUCT_WORDS = frozenset(
+    """yes no ok okay sure thanks please cancel stop first second third fourth fifth last
+    one two three four five it that this them those these cheaper cheapest rated review
+    reviews price prices what which how why when who where does do is are the a an and or
+    but hmm actually maybe about something else other others another different instead
+    anything else something option options list cart them all any more some""".split()
+)
+
+
+def _new_product_query(message: str, workflow: PurchaseWorkflow) -> str | None:
+    """Return a search query when the message names a product not already shown.
+
+    "i need head and shoulders" during a shampoo search is a new search, not an
+    unanswerable reply. Anything that only refers to what is on screen returns None.
+    """
+    stripped = REQUEST_PREFIX.sub("", message.strip()).strip()
+    if not stripped:
+        return None
+    words = [word for word in re.findall(r"[a-z0-9']+", stripped.casefold())]
+    meaningful = [word for word in words if word not in NON_PRODUCT_WORDS and len(word) > 2]
+    if not meaningful:
+        return None
+    # If every meaningful word already appears in the results, the user is referring to
+    # them rather than asking for something else.
+    shown = " ".join(candidate.title.casefold() for candidate in workflow.candidates)
+    if all(word in shown for word in meaningful):
+        return None
+    return stripped
+
+
+def _resolve_or_research(
+    workflow: PurchaseWorkflow, message: str, workflow_database_path: str | Path
+) -> str:
+    """Try the deterministic resolver, and only then give up.
+
+    The resolver already understands "cheapest" and brand names. It used to sit behind
+    the classifier, so a `no_match` from the local model re-offered the very word the
+    agent had just suggested. This is the path that guarantees suggested words work.
+    """
+    resolution = candidate_resolver.resolve_candidate_reference(message, workflow.candidates)
+    if resolution.candidate:
+        return _select_candidate(workflow, resolution.candidate, workflow_database_path)
+    return resolution.message or _reask_pending_question(workflow)
 
 
 def _cancel_workflow(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
@@ -478,7 +531,9 @@ async def agent_brain(
         reply = workflow_reply.interpret(message, active_workflow.candidates)
         if reply.is_confident:
             print(f"[ROUTING] deterministic workflow reply intent={reply.intent}")
-            return _apply_workflow_reply(active_workflow, reply, workflow_database_path)
+            return _apply_workflow_reply(
+                active_workflow, reply, workflow_database_path, message
+            )
 
     timing.mark_prepare_complete()
     semantic_task = asyncio.create_task(
@@ -549,7 +604,27 @@ async def agent_brain(
         ):
             return _ask_what_to_search(telegram_user_id, message, workflow_database_path)
         if active_workflow and semantic_action.route in {"workflow", "unknown"}:
-            # A pending question deserves the question again, not an unrelated answer.
+            # The local model says it does not know. Try the deterministic resolver, and
+            # if the message names something not in the current results, search for it
+            # instead of trapping the user in the same question.
+            resolution = candidate_resolver.resolve_candidate_reference(
+                message, active_workflow.candidates
+            )
+            if resolution.candidate:
+                return _select_candidate(
+                    active_workflow, resolution.candidate, workflow_database_path
+                )
+            new_query = _new_product_query(message, active_workflow)
+            if new_query:
+                return await _start_purchase_workflow(
+                    telegram_user_id,
+                    message,
+                    new_query,
+                    workflow_database_path,
+                    existing=active_workflow,
+                )
+            if resolution.ambiguous:
+                return resolution.message
             return _reask_pending_question(active_workflow)
         return await _general_response(message, active_workflow)
     except Exception as error:

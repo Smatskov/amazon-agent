@@ -94,21 +94,46 @@ def test_candidate_facts_report_a_missing_price_rather_than_omitting_it():
     assert "each" not in facts
 
 
-def test_next_step_hint_offers_only_applicable_replies():
-    unrated = [_candidate("A", price=1.0), _candidate("B", price=2.0)]
+def test_next_step_hint_drops_jargon_and_offers_a_way_to_narrow():
+    """"cheapest" and "highest rated" read as jargon and gave no way to refine."""
+    candidates = [
+        _candidate("Duracell AA Batteries", price=4.0),
+        _candidate("Energizer AA Batteries", price=20.0),
+    ]
 
-    hint = product_display.next_step_hint(unrated)
+    hint = product_display.next_step_hint(candidates)
 
-    assert "1 to 2" in hint
-    assert '"cheapest"' in hint
+    assert "cheapest" not in hint
     assert "highest rated" not in hint
+    assert "1–2" in hint
+    assert "Narrow it" in hint
+    assert "name what you want instead" in hint
 
 
-def test_next_step_hint_for_a_single_candidate_does_not_ask_for_a_number():
+def test_hint_examples_are_drawn_from_the_actual_results():
+    """A suggested brand must be one the user can really type and get a match."""
+    candidates = [
+        _candidate("Duracell AA Batteries", price=4.0),
+        _candidate("Energizer AA Batteries", price=20.0),
+    ]
+
+    hint = product_display.next_step_hint(candidates)
+
+    assert "Duracell" in hint
+    assert "under $" in hint
+
+
+def test_hint_omits_a_budget_example_when_prices_are_identical():
+    same = [_candidate("A", price=5.0), _candidate("B", price=5.0)]
+
+    assert "under $" not in product_display.next_step_hint(same)
+
+
+def test_next_step_hint_for_a_single_candidate_asks_for_one_not_a_range():
     hint = product_display.next_step_hint([_candidate("Only one", price=1.0)])
 
-    assert "number" not in hint
-    assert '"yes" to choose it' in hint
+    assert "reply 1 " in hint
+    assert "–" not in hint
 
 
 def test_presented_candidates_are_spaced_and_carry_the_ranking_basis():

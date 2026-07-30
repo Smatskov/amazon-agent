@@ -157,7 +157,7 @@ def test_bare_yes_with_several_candidates_asks_which_one(paths, monkeypatch):
     reply = _run("yes", paths)
 
     assert "still on your search" in reply
-    assert "1 to 3" in reply
+    assert "1–3" in reply
 
 
 def test_bare_yes_with_a_single_candidate_selects_it(paths, monkeypatch):

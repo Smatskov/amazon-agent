@@ -38,6 +38,10 @@ PLURAL_ES = ("ses", "xes", "zes", "ches", "shes")
 class CandidateResolution:
     candidate: Candidate | None
     message: str | None = None
+    # True when several candidates fit equally. An ambiguous reference deserves its own
+    # focused question; a reference that matched nothing is better served by the full
+    # next-step guidance.
+    ambiguous: bool = False
 
 
 def resolve_candidate_reference(message: str, candidates: list[Candidate]) -> CandidateResolution:
@@ -160,4 +164,8 @@ def _from_matches(matches: list[Candidate], label: str) -> CandidateResolution:
         return CandidateResolution(matches[0])
     if not matches:
         return CandidateResolution(None, f"I couldn't match {label}. Please name an option or number.")
-    return CandidateResolution(None, f"More than one option matches {label}. Which option do you mean?")
+    return CandidateResolution(
+        None,
+        f"More than one option matches {label}. Which option do you mean?",
+        ambiguous=True,
+    )

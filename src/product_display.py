@@ -83,18 +83,58 @@ def candidate_facts(candidate: Candidate) -> str:
 
 
 def next_step_hint(candidates: list[Candidate]) -> str:
-    """Offer only the replies that make sense for these specific candidates."""
-    options = []
+    """Say what to type, using this list's own facts as the examples.
+
+    The previous line offered "cheapest" and "highest rated", which read as jargon and
+    gave no way to narrow the search. Concrete examples drawn from the results are
+    easier to act on: a brand that is actually present, a price the results straddle.
+    """
+    if not candidates:
+        return 'Search for something, or say "cancel".'
+
+    lines = [
+        f"**Pick one:** reply {'1' if len(candidates) == 1 else f'1–{len(candidates)}'} "
+        "to add it to your list."
+    ]
+
+    narrow = []
+    # With a single result there is nothing to narrow, so only offer a fresh search.
     if len(candidates) > 1:
-        options.append(f"a number from 1 to {len(candidates)}")
-    else:
-        options.append('"yes" to choose it')
-    if sum(1 for candidate in candidates if candidate.price is not None) > 1:
-        options.append('"cheapest"')
-    if sum(1 for candidate in candidates if candidate.rating is not None) > 1:
-        options.append('"highest rated"')
-    options.append('"cancel"')
-    return f"Reply with {_sentence_list(options)}."
+        brand = _example_brand(candidates)
+        if brand:
+            narrow.append(f'a brand, like "{brand}"')
+        budget = _example_budget(candidates)
+        if budget:
+            narrow.append(f'a budget, like "under ${budget}"')
+    narrow.append("or just name what you want instead")
+    lines.append(f"**Narrow it:** type {_sentence_list_plain(narrow)}.")
+
+    lines.append('**Or:** "cancel" to stop.')
+    return "\n".join(lines)
+
+
+def _example_brand(candidates: list[Candidate]) -> str | None:
+    """Use a brand that is genuinely in these results, so the example always works."""
+    for candidate in candidates:
+        first = candidate.title.split()
+        if first and first[0].isalpha() and len(first[0]) > 2:
+            return first[0]
+    return None
+
+
+def _example_budget(candidates: list[Candidate]) -> str | None:
+    """Suggest a threshold that would actually exclude something."""
+    prices = sorted(c.price for c in candidates if c.price is not None)
+    if len(prices) < 2 or prices[0] == prices[-1]:
+        return None
+    middle = prices[len(prices) // 2]
+    return f"{int(middle)}" if middle >= 2 else None
+
+
+def _sentence_list_plain(items: list[str]) -> str:
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])}, {items[-1]}"
 
 
 def present_candidates(

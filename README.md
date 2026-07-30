@@ -4,10 +4,13 @@ A personal, local-first purchasing assistant controlled through Telegram. A mess
 Telegram bot, a locally hosted language model interprets it, and deterministic Python code
 executes memory and read-only Amazon work.
 
-**Status: preview only.** The agent can remember explicit facts, search Amazon read-only, and
-present product candidates. It cannot add to cart, check out, or place an order, and it is not
-reliable enough for daily use yet. See `Handoff Files/PROJECT_STATE.md` for the current
-implementation checkpoint and known issues.
+**Status: preview only.** The agent remembers explicit facts, searches Amazon read-only, ranks
+and presents results, answers questions about them, and builds a shopping list through to an
+order summary you can approve.
+
+It stops there, deliberately. **No code path can place an Amazon order**, and the list it
+builds is its own — nothing is ever added to your real Amazon cart. See
+`Handoff Files/PROJECT_STATE.md` for the current checkpoint and known gaps.
 
 ## Documentation map
 
@@ -31,7 +34,8 @@ cp .env.example .env   # then fill in the values
 
 Required in `.env`: `TELEGRAM_BOT_TOKEN`, `AUTHORIZED_TELEGRAM_USER_ID`, `LLM_BASE_URL`,
 `LLM_MODEL`. Optional: `AMAZON_BROWSER_PROFILE_DIR` (defaults to a directory under
-`~/Library/Application Support/Amazon Agent`), `AMAZON_BROWSER_HEADLESS` (defaults to visible).
+`~/Library/Application Support/Amazon Agent`), `AMAZON_BROWSER_HEADLESS` (defaults to `true`,
+so searches run in the background with no window; set `false` to watch while debugging).
 
 LM Studio must be running and serving the model named in `LLM_MODEL`.
 
@@ -75,7 +79,17 @@ PYTHONPATH=src .venv/bin/python scripts/live_semantic_probe.py
 
 ## Safety
 
-Purchasing is staged: search → recommend → cart → checkout preparation → explicit confirmation →
-narrowly preapproved automation. Only the first two stages exist. No code path can place an
-order, and the model never executes tools — it classifies and explains, while Python validates
-and acts.
+Purchasing is staged: search → recommend → list → checkout preparation → explicit confirmation →
+(not implemented) ordering. Everything up to and including confirmation exists. Ordering does not.
+
+Three things enforce that, rather than one:
+
+- `amazon.py` exposes only `search_products()` and a manual sign-in helper. There is no cart,
+  checkout, or order function to call.
+- Buy-phrasing ("place the order", "confirm", "buy it now") is matched deterministically before
+  any model call, so a language model can never be the thing that claims an order was placed.
+- `checkout.place_order()` exists only to raise, and tests assert nothing calls it.
+
+The list the agent builds lives in its own SQLite database. Nothing is added to your Amazon
+cart, and prices are copied from search results rather than recomputed — so a subtotal is the
+sum of what Amazon showed, with shipping, tax, and delivery reported as unknown.

@@ -9,7 +9,8 @@
 - `memory.py` owns preference memory; `workflow_store.py` owns persistent purchasing workflow state.
 - `amazon.py` owns all Amazon/Playwright operations.
 - `product_evaluator.py` compares supplied product records with a fact-bounded prompt, and serializes stored candidates as model-facing context.
-- `ranking.py` owns deterministic hard filtering and ordering; `product_display.py` owns Telegram presentation of candidates.
+- `ranking.py` owns deterministic hard filtering and ordering; `product_display.py` owns Telegram presentation of candidates, the list, and the order summary.
+- `cart.py` owns the user's chosen items as pure operations; `checkout.py` owns the order summary, the confirmation token, and the refusal to place an order.
 - `workflow_reply.py` reads unambiguous replies to the agent's own question without a model call; `candidate_resolver.py` resolves references to stored candidates after the model has classified a selection.
 - `request_context.py` carries request facts; `workflow_models.py` carries workflow records.
 - `response_policy.py` owns prompt and response-format policy; `timing.py` owns request-scoped latency measurement.
@@ -45,7 +46,17 @@ Only the second path creates a workflow. Only the first path invokes the evaluat
 
 Initial policy is one active workflow per Telegram user, persisted in SQLite across restarts. States are `idle`, `awaiting_request_clarification`, `checking_purchase_history`, `awaiting_repurchase_confirmation`, `searching_products`, `presenting_candidates`, `awaiting_product_selection`, `refining_search`, `preparing_cart`, `preparing_checkout`, `awaiting_checkout_confirmation`, `placing_order`, `completed`, `cancelled`, `failed`, and `paused`.
 
-Current behavior asks a clarifying question when a shopping request has no product (persisted as `awaiting_request_clarification`), creates a workflow from real read-only Amazon results, filters and ranks them deterministically, presents typed candidates, answers questions about them from stored facts, narrows them on refinement, stores selection and quantity, and allows cancellation. It never enters cart, checkout-confirmation, placement, or completed-order transitions; those states are type-level placeholders for later milestones. Every state change goes through `workflow_store.transition()` so `state_version` stays a reliable basis for the future confirmation gate. A workflow untouched for 24 hours stops counting as active (ADR-046). Purchase history remains separate from preferences.
+Current behavior asks a clarifying question when a shopping request has no product (`awaiting_request_clarification`), searches read-only, filters and ranks deterministically, presents typed candidates, answers questions from stored facts, narrows on refinement, builds a list (`preparing_cart`), and prepares an order summary for approval (`awaiting_checkout_confirmation`).
+
+It never enters `placing_order` or `completed`. Those remain type-level placeholders, and a test asserts `agent.py` never names them. Every state change goes through `workflow_store.transition()` so `state_version` stays reliable. A workflow untouched for 24 hours stops counting as active (ADR-046). Purchase history remains separate from preferences.
+
+## The order gate
+
+```text
+preparing_cart → "checkout" → awaiting_checkout_confirmation → "confirm" → REFUSED
+```
+
+The list is the agent's own SQLite state, not Amazon's cart (ADR-048): nothing is sent to Amazon and no Amazon cart is modified. Buy-phrasing is matched deterministically before any model call and routed to the gate (ADR-049), so a language model can never be the thing that claims an order was placed. `checkout.place_order()` exists only to raise. A confirmation is a fingerprint of exact contents, so any edit invalidates it (ADR-026).
 
 ## Stored data
 

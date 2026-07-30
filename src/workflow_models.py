@@ -57,6 +57,26 @@ class Candidate:
     source_url: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CartLine:
+    """One item the user chose, copied from a stored candidate.
+
+    Prices are copied, never recomputed from a remembered value, so a line can only
+    ever show what Amazon actually displayed for that result.
+    """
+
+    candidate_id: str
+    title: str
+    price: float | None
+    quantity: int
+    price_text: str | None = None
+    source_url: str | None = None
+
+    @property
+    def line_total(self) -> float | None:
+        return None if self.price is None else round(self.price * self.quantity, 2)
+
+
 @dataclass(slots=True)
 class PurchaseWorkflow:
     telegram_user_id: int
@@ -69,6 +89,10 @@ class PurchaseWorkflow:
     pending_question: str | None = None
     candidates: list[Candidate] = field(default_factory=list)
     selected_candidate_id: str | None = None
+    cart: list[CartLine] = field(default_factory=list)
+    # Identifies the exact order contents the user last confirmed. Any change to the
+    # cart produces a different token, which invalidates the confirmation (ADR-026).
+    confirmed_token: str | None = None
     quantity: int = 1
     conversation_summary: str = ""
     created_at: str = ""
@@ -111,5 +135,8 @@ class PurchaseWorkflow:
         data["candidates"] = [
             Candidate(**_known_fields(Candidate, candidate))
             for candidate in record.get("candidates") or []
+        ]
+        data["cart"] = [
+            CartLine(**_known_fields(CartLine, line)) for line in record.get("cart") or []
         ]
         return cls(**data)

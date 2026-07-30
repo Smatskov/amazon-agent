@@ -33,14 +33,56 @@ def test_profile_directory_rejects_repository_path(monkeypatch):
         amazon.browser_profile_dir()
 
 
-def test_visible_browser_is_default_and_headless_is_explicit(monkeypatch):
+def test_background_browser_is_default_and_visible_mode_is_explicit(monkeypatch):
+    """A window must not pop open on every Telegram message."""
     monkeypatch.delenv("AMAZON_BROWSER_HEADLESS", raising=False)
-    assert amazon._browser_headless() is False
-    monkeypatch.setenv("AMAZON_BROWSER_HEADLESS", "true")
     assert amazon._browser_headless() is True
+    monkeypatch.setenv("AMAZON_BROWSER_HEADLESS", "false")
+    assert amazon._browser_headless() is False
 
 
-def test_persistent_context_uses_configured_profile_and_visible_mode(monkeypatch, tmp_path):
+def test_manual_sign_in_is_always_visible_even_when_headless_is_configured(monkeypatch, tmp_path):
+    """The sign-in script exists to be used by a human, so it ignores the setting."""
+    monkeypatch.setenv("AMAZON_BROWSER_PROFILE_DIR", str(tmp_path / "profile"))
+    monkeypatch.setenv("AMAZON_BROWSER_HEADLESS", "true")
+    calls = {}
+
+    class Context:
+        pages = []
+
+        async def new_page(self):
+            raise AssertionError("the probe stops before navigation")
+
+        async def close(self):
+            pass
+
+    class Chromium:
+        async def launch_persistent_context(self, path, **kwargs):
+            calls["headless"] = kwargs["headless"]
+            return Context()
+
+    class Playwright:
+        chromium = Chromium()
+
+    class Manager:
+        async def __aenter__(self):
+            return Playwright()
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(amazon, "async_playwright", lambda: Manager())
+
+    async def open_and_close():
+        async with amazon._persistent_browser_context(headless=False):
+            pass
+
+    asyncio.run(open_and_close())
+
+    assert calls["headless"] is False
+
+
+def test_persistent_context_uses_configured_profile_and_background_mode(monkeypatch, tmp_path):
     profile = tmp_path / "amazon-profile"
     monkeypatch.setenv("AMAZON_BROWSER_PROFILE_DIR", str(profile))
     monkeypatch.delenv("AMAZON_BROWSER_HEADLESS", raising=False)
@@ -75,7 +117,7 @@ def test_persistent_context_uses_configured_profile_and_visible_mode(monkeypatch
     asyncio.run(open_and_close())
 
     assert calls["path"] == str(profile.resolve())
-    assert calls["kwargs"]["headless"] is False
+    assert calls["kwargs"]["headless"] is True
     assert calls["kwargs"]["viewport"] == {"width": 1440, "height": 1000}
     assert calls["closed"] is True
 

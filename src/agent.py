@@ -1,6 +1,7 @@
 # Coordinates the AI agent by deciding what actions to take and delegating work to other modules.
 
 import asyncio
+import hashlib
 from pathlib import Path
 import re
 from time import perf_counter
@@ -8,6 +9,8 @@ from time import perf_counter
 from llm_client import generate_response
 import amazon
 import candidate_resolver
+import cart
+import checkout
 import intent_classifier
 import memory
 import product_display
@@ -123,6 +126,16 @@ def _search_query(message: str) -> str | None:
     return details.strip()
 
 
+DELIVERY_QUESTION = re.compile(
+    r"\b(?:how long|when will|when would|when do|arrive|arrives|arrival|delivery|"
+    r"delivered|deliver|get here|ship by|shipping time)\b"
+)
+
+
+def _asks_about_delivery(message: str) -> bool:
+    return bool(DELIVERY_QUESTION.search(message.casefold()))
+
+
 def _looks_like_shopping_request(message: str) -> bool:
     """Block semantic no-matches from becoming ungrounded shopping advice."""
     return bool(_SHOPPING_MARKER_PATTERN.search(message.casefold()))
@@ -155,6 +168,13 @@ def _is_awaiting_clarification(workflow: PurchaseWorkflow | None) -> bool:
 
 def _reask_pending_question(workflow: PurchaseWorkflow) -> str:
     """Repeat the outstanding question instead of answering something else."""
+    if workflow.state == WorkflowState.AWAITING_CHECKOUT_CONFIRMATION:
+        return "I'm waiting on your confirmation of the order summary. Reply 'confirm' or 'cancel'."
+    if workflow.state == WorkflowState.PREPARING_CART and workflow.cart:
+        return (
+            f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}\n\n"
+            "Search for something else to add, or say 'checkout'."
+        )
     if workflow.candidates:
         return (
             f"I'm still on your search for '{workflow.normalized_product_goal}'.\n\n"
@@ -171,12 +191,33 @@ def _apply_workflow_reply(
     """Execute an unambiguous reply without waiting for the local model."""
     if reply.intent is workflow_reply.ReplyIntent.CANCEL:
         return _cancel_workflow(workflow, workflow_database_path)
+    # Order and checkout phrasing is answered by the gate itself, never by the model.
+    if reply.intent is workflow_reply.ReplyIntent.CONFIRM_ORDER:
+        return _confirm_order(workflow, workflow_database_path)
+    if reply.intent is workflow_reply.ReplyIntent.CHECKOUT:
+        return _begin_checkout(workflow, workflow_database_path)
 
     if _is_awaiting_clarification(workflow):
         # A bare yes or no is not a product name, so the question still stands.
         if reply.intent is workflow_reply.ReplyIntent.DECLINE:
             return _cancel_workflow(workflow, workflow_database_path)
         return CLARIFICATION_QUESTION
+
+    if workflow.state == WorkflowState.AWAITING_CHECKOUT_CONFIRMATION:
+        # "yes" here means approving an order, so it must reach the gate itself.
+        if reply.intent is workflow_reply.ReplyIntent.AFFIRM:
+            return _confirm_order(workflow, workflow_database_path)
+        if reply.intent is workflow_reply.ReplyIntent.DECLINE:
+            workflow_store.transition(
+                workflow,
+                WorkflowState.PREPARING_CART,
+                pending_question="Add anything else, or check out?",
+            )
+            workflow_store.save_workflow(workflow, workflow_database_path)
+            return (
+                "Not confirmed — nothing was ordered.\n\n"
+                f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+            )
 
     if reply.intent is workflow_reply.ReplyIntent.SELECT_POSITION:
         return _select_candidate(
@@ -241,33 +282,146 @@ def _cancel_workflow(workflow: PurchaseWorkflow, workflow_database_path: str | P
 
 
 def _select_candidate(
-    workflow: PurchaseWorkflow, candidate: Candidate, workflow_database_path: str | Path
+    workflow: PurchaseWorkflow,
+    candidate: Candidate,
+    workflow_database_path: str | Path,
+    quantity: int | None = None,
 ) -> str:
+    """Choosing an option puts it on the list; picking and adding are one step."""
+    # A quantity stated before picking ("make it two") applies to this item, then the
+    # default returns to one so it does not silently follow every later item.
+    already_listed = cart.find(workflow.cart, candidate.candidate_id)
+    if already_listed and quantity is None:
+        # "add it" for something already listed is a restatement, not a request for
+        # a second one; silently doubling the quantity would be a costly surprise.
+        return (
+            f"{product_display.display_title(candidate.title)} is already on your list "
+            f"(qty {already_listed.quantity}).\n\n"
+            f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+        )
+
+    quantity = quantity or workflow.quantity
+    workflow.quantity = 1
     workflow.selected_candidate_id = candidate.candidate_id
+    workflow.cart = cart.add(workflow.cart, candidate, quantity)
+    # Any change to the contents invalidates a previous confirmation (ADR-026).
+    workflow.confirmed_token = None
     workflow_store.transition(
         workflow,
-        WorkflowState.PAUSED,
-        pending_question="Checkout preview is not implemented yet.",
+        WorkflowState.PREPARING_CART,
+        pending_question="Add anything else, or check out?",
+    )
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    line = cart.find(workflow.cart, candidate.candidate_id)
+    return (
+        f"Added {product_display.display_title(candidate.title)} "
+        f"(qty {line.quantity}).\n\n"
+        f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}\n\n"
+        "Search for something else to add, say 'checkout' to review, "
+        "or 'remove' to take something off."
+    )
+
+
+def _cart_as_candidates(workflow: PurchaseWorkflow) -> list[Candidate]:
+    """Let the existing resolver name a cart line the same way it names a result."""
+    return [
+        Candidate(
+            candidate_id=line.candidate_id,
+            title=line.title,
+            brand=None,
+            price=line.price,
+            price_text=line.price_text,
+        )
+        for line in workflow.cart
+    ]
+
+
+def _remove_from_cart(
+    workflow: PurchaseWorkflow, message: str, workflow_database_path: str | Path
+) -> str:
+    if not workflow.cart:
+        return "Your list is already empty."
+    if len(workflow.cart) == 1:
+        target = workflow.cart[0].candidate_id
+    else:
+        resolution = candidate_resolver.resolve_candidate_reference(
+            message, _cart_as_candidates(workflow)
+        )
+        if not resolution.candidate:
+            return f"{resolution.message}\n\n{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+        target = resolution.candidate.candidate_id
+
+    removed = cart.find(workflow.cart, target)
+    workflow.cart = cart.remove(workflow.cart, target)
+    workflow.confirmed_token = None
+    workflow_store.transition(
+        workflow,
+        WorkflowState.PREPARING_CART,
+        pending_question="Add anything else, or check out?",
     )
     workflow_store.save_workflow(workflow, workflow_database_path)
     return (
-        f"Selected {product_display.display_title(candidate.title)} "
-        f"(quantity {workflow.quantity}).\n\n"
-        "Cart, checkout preview, and ordering are intentionally not implemented yet, "
-        "so nothing has been bought. Say 'cancel' when you want to start something else."
+        f"Removed {product_display.display_title(removed.title)}.\n\n"
+        f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+    )
+
+
+def _begin_checkout(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
+    if not workflow.cart:
+        return "There is nothing to check out yet. Search for something and pick an option first."
+    summary = checkout.summarize(workflow)
+    workflow_store.transition(
+        workflow,
+        WorkflowState.AWAITING_CHECKOUT_CONFIRMATION,
+        pending_question="Confirm this order summary?",
+    )
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return product_display.present_checkout(summary)
+
+
+def _confirm_order(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
+    """The confirmation gate. It records approval and then refuses to order."""
+    if workflow.state != WorkflowState.AWAITING_CHECKOUT_CONFIRMATION:
+        if not workflow.cart:
+            return "There is nothing to confirm yet. Pick something first."
+        return "Say 'checkout' first so I can show you the exact summary to confirm."
+
+    workflow.confirmed_token = checkout.confirmation_token(workflow)
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    summary = checkout.summarize(workflow)
+    subtotal = "unknown" if summary.subtotal is None else f"${summary.subtotal:.2f}"
+    return (
+        f"Confirmed: {summary.item_count} item(s), items subtotal {subtotal}.\n\n"
+        "I cannot place this order. Ordering is deliberately not implemented — there is "
+        "no code path in this agent that can submit a purchase to Amazon, by design.\n\n"
+        "Your list is saved, so open Amazon yourself to buy these. "
+        "Say 'cancel' when you're done."
     )
 
 
 async def _general_response(message: str, workflow: PurchaseWorkflow | None = None) -> str:
     """Generate bounded conversation, supplying the options on screen as facts."""
     prompt = message
-    if workflow and workflow.candidates:
+    if workflow and (workflow.candidates or workflow.cart):
+        context = []
+        if workflow.candidates:
+            context.append(
+                "Numbered Amazon results currently shown: "
+                f"{product_evaluator.candidate_context(workflow.candidates)}"
+            )
+        # Without this the model answers "what's in my cart?" from nothing and can
+        # contradict the list the agent just printed.
+        context.append(
+            "Items on this user's list right now: "
+            f"{product_evaluator.cart_context(workflow.cart)}"
+            if workflow.cart
+            else "This user's list is currently empty."
+        )
+        joined = "\n".join(context)
         prompt = (
             f"{message}\n\n"
-            "Context — the numbered Amazon results currently shown to this user. Answer "
-            "from these facts when the question is about them, and never add facts that "
-            "are not listed:\n"
-            f"{product_evaluator.candidate_context(workflow.candidates)}"
+            "Context. Answer from these facts when the question is about them, and never "
+            f"add facts that are not listed:\n{joined}"
         )
     response = await generate_response(
         prompt,
@@ -366,9 +520,8 @@ async def agent_brain(
         if semantic_action.route == "memory" and semantic_action.action in {"remember", "recall", "forget"}:
             return _memory_response(semantic_action.action, semantic_action.key, semantic_action.value, memory_database_path)
         if semantic_action.route == "purchase" and semantic_action.action == "purchase_start":
-            # A pending clarification is answered by this request, not blocked by it.
-            if active_workflow and not _is_awaiting_clarification(active_workflow):
-                return f"You already have an active purchase workflow for '{active_workflow.normalized_product_goal}'. Say 'cancel' before starting another one."
+            # Shopping is iterative: a second request searches again and keeps the
+            # list, so several products can be gathered in one conversation.
             return await _start_purchase_workflow(
                 telegram_user_id,
                 message,
@@ -420,11 +573,24 @@ def _price_amount(price_text: str | None) -> float | None:
         return None
 
 
+def _candidate_id(product: amazon.Product) -> str:
+    """Identify a candidate by Amazon's own product identity, not by its position.
+
+    Position-based ids collided across searches in one conversation, so a product
+    from a later search merged into an unrelated line already on the list.
+    """
+    asin = re.search(r"/dp/([A-Za-z0-9]+)", product.url)
+    if asin:
+        return f"amazon-{asin.group(1)}"
+    digest = hashlib.sha1(product.url.encode("utf-8")).hexdigest()[:12]
+    return f"amazon-url-{digest}"
+
+
 def _candidates_from_products(products: list[amazon.Product]) -> list[Candidate]:
     """Persist only facts returned by the isolated read-only Amazon boundary."""
     return [
         Candidate(
-            candidate_id=f"amazon-result-{index}",
+            candidate_id=_candidate_id(product),
             title=product.title,
             brand=None,
             price=_price_amount(product.price),
@@ -492,9 +658,19 @@ async def _start_purchase_workflow(
         pending_question="Which candidate would you like?",
     )
     workflow_store.save_workflow(workflow, workflow_database_path)
-    return product_display.present_candidates(
+    results = product_display.present_candidates(
         goal, ranked, removed=outcome.removed, removal_reasons=outcome.reasons
     )
+    if _asks_about_delivery(message):
+        # Ignoring the question the user actually asked reads as evasive.
+        results += (
+            "\n\nI can't answer the delivery part yet: Amazon search results don't show "
+            "delivery dates, and I don't know your address."
+        )
+    if workflow.cart:
+        # Searching again must not look like the earlier picks were lost.
+        results += f"\n\nStill on your list: {cart.item_count(workflow.cart)} item(s). Say 'list' to see them."
+    return results
 
 
 def _continue_purchase_workflow(
@@ -506,21 +682,75 @@ def _continue_purchase_workflow(
     """Interpret stored workflow context without cart, checkout, or purchase actions."""
     if action.action == "cancel":
         return _cancel_workflow(workflow, workflow_database_path)
-    if action.action == "change_quantity":
-        if not action.quantity or action.quantity < 1:
-            return "Please provide a quantity of at least one."
-        workflow.quantity = action.quantity
-        workflow_store.save_workflow(workflow, workflow_database_path)
-        return f"Updated the workflow quantity to {workflow.quantity}."
     if action.action == "refine":
         return _refine_candidates(workflow, action, message, workflow_database_path)
+    if action.action == "view_cart":
+        return product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))
+    if action.action == "remove_from_cart":
+        return _remove_from_cart(workflow, message, workflow_database_path)
+    if action.action == "checkout":
+        return _begin_checkout(workflow, workflow_database_path)
     if action.action == "confirm":
-        return "Checkout confirmation is not available yet; no cart or order action has been started."
+        return _confirm_order(workflow, workflow_database_path)
+    if action.action == "change_quantity":
+        return _change_quantity(workflow, action, message, workflow_database_path)
 
+    # select_candidate and add_to_cart both mean "I want this one".
     resolution = candidate_resolver.resolve_candidate_reference(message, workflow.candidates)
-    if not resolution.candidate:
+    candidate = resolution.candidate or _last_referenced_candidate(workflow)
+    if not candidate:
         return resolution.message or "Please choose one of the presented options."
-    return _select_candidate(workflow, resolution.candidate, workflow_database_path)
+    return _select_candidate(workflow, candidate, workflow_database_path, action.quantity)
+
+
+def _last_referenced_candidate(workflow: PurchaseWorkflow) -> Candidate | None:
+    """Resolve "it" or "that" to whatever the user most recently picked."""
+    if not workflow.selected_candidate_id:
+        return None
+    return next(
+        (
+            candidate
+            for candidate in workflow.candidates
+            if candidate.candidate_id == workflow.selected_candidate_id
+        ),
+        None,
+    )
+
+
+def _change_quantity(
+    workflow: PurchaseWorkflow,
+    action: intent_classifier.SemanticAction,
+    message: str,
+    workflow_database_path: str | Path,
+) -> str:
+    """Change the quantity of a listed item, or of the next item to be added."""
+    if not action.quantity or action.quantity < 1:
+        return "Please provide a quantity of at least one."
+
+    if not workflow.cart:
+        workflow.quantity = action.quantity
+        workflow_store.save_workflow(workflow, workflow_database_path)
+        return f"I'll use a quantity of {workflow.quantity} for the next item you pick."
+
+    if len(workflow.cart) == 1:
+        target = workflow.cart[0].candidate_id
+    else:
+        resolution = candidate_resolver.resolve_candidate_reference(
+            message, _cart_as_candidates(workflow)
+        )
+        if not resolution.candidate:
+            return f"Which item should be quantity {action.quantity}?\n\n{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+        target = resolution.candidate.candidate_id
+
+    workflow.cart = cart.set_quantity(workflow.cart, target, action.quantity)
+    workflow.confirmed_token = None
+    workflow_store.transition(
+        workflow,
+        WorkflowState.PREPARING_CART,
+        pending_question="Add anything else, or check out?",
+    )
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))
 
 
 def _workflow_summary(workflow: PurchaseWorkflow | None) -> str:

@@ -1360,3 +1360,164 @@ Consequences:
 - ADR-030's one-active-workflow rule still holds; it is now bounded in time.
 - When cart and checkout are implemented, an expiring workflow must not be able to strand a
   prepared order: expiry policy has to be revisited alongside the ADR-026 confirmation gate.
+
+---
+
+## ADR-047 — Amazon Searches Run in the Background by Default
+
+Status: Accepted and implemented; refines ADR-039
+
+Decision:
+
+`AMAZON_BROWSER_HEADLESS` defaults to true, so an ordinary search opens no window.
+`AMAZON_BROWSER_HEADLESS=false` restores a visible browser for debugging.
+`open_profile_for_manual_sign_in()` forces a visible browser regardless of the setting.
+
+Context:
+
+ADR-039 chose a visible browser as the safe default while read-only search was being
+proven. In use that means a "Google Chrome for Testing" window pops open and closes on
+every Telegram message, which is intrusive enough to make the agent unpleasant to use.
+
+Reasoning:
+
+- Headless is a display choice, not an evasion: the same persistent profile, the same
+  signed-in session, and the same public pages are used. Nothing about ADR-039's rule
+  against bypassing CAPTCHAs or protections changes.
+- The one step that genuinely needs a window — manual sign-in — now asks for one
+  explicitly rather than depending on a global default.
+
+Tradeoffs:
+
+- A challenge or interstitial is no longer visible as it happens; it surfaces as a
+  failed search instead. The remedy is to set the variable to false and re-run sign-in.
+- Headless sessions can be treated differently by some sites. This has not been verified
+  live against Amazon with the signed-in profile, and that verification is outstanding.
+
+Consequences:
+
+- `_persistent_browser_context()` takes an explicit `headless` override.
+- If searches begin failing after this change, the first diagnostic step is
+  `AMAZON_BROWSER_HEADLESS=false` plus `scripts/amazon_profile_login.py`.
+
+---
+
+## ADR-048 — The List Is the Agent's Own, Not Amazon's Cart
+
+Status: Accepted and implemented; refines ADR-030
+
+Decision:
+
+Adding an item records a `CartLine` in the agent's own SQLite workflow. Nothing is sent
+to Amazon, and no Amazon cart is modified. Every message that shows the list states this.
+A second purchase request searches again and keeps the list, so one conversation can
+gather several products.
+
+Context:
+
+The workflow ended at "selected", and a request to add something to a cart produced
+"Updated the workflow quantity", which reads as though a cart action succeeded. Separately,
+ADR-030 required cancelling before starting another search, so asking for a second product
+was refused outright — the worst moment in a role-played conversation.
+
+Reasoning:
+
+- A basket is the natural centre of a shopping conversation; without one the agent
+  cannot express quantity, multiple items, or a total.
+- Writing to a real Amazon cart requires browser automation whose selectors cannot be
+  verified without a live signed-in session. On a page where "Add to Cart" sits beside
+  "Buy Now", an unverified selector is an unacceptable risk. The local list delivers the
+  entire product experience with none of that exposure.
+- Saying "nothing has been added to your Amazon cart" on every list message prevents the
+  single most damaging misunderstanding this agent could create.
+- Shopping is iterative. Keeping the list across searches turns ADR-030's one-workflow
+  rule from a restriction into a container.
+
+Tradeoffs:
+
+- The user must still buy on Amazon themselves; the agent stops one step short.
+- Prices are copied at the time of the search and can go stale.
+- A real Amazon cart adapter remains future work and needs its own ADR, live selector
+  verification, and the ADR-026 controls before it may write anything.
+
+Consequences:
+
+- `cart.py` holds pure operations over stored candidate facts; a line can only ever show
+  what a read-only search returned.
+- An unknown price makes the whole subtotal unknown rather than quietly smaller.
+- Restating "add it" for something already listed reports the existing line instead of
+  doubling the quantity.
+
+---
+
+## ADR-049 — Order Placement Is Refused Deterministically, Before the Model
+
+Status: Accepted and implemented
+
+Decision:
+
+Phrasing that asks to buy — "place the order", "confirm", "order it now", "buy it now" —
+is matched deterministically in `workflow_reply.py` and routed to the agent's own
+confirmation gate. The gate records the approval and refuses, because ordering is not
+implemented. `checkout.place_order()` exists solely to raise `OrderPlacementDisabled`.
+
+Context:
+
+In a role-played conversation, "yes place the order" was classified as general chat and
+answered by the language model. With a real model that reply could have been "Your order
+has been placed" — a false confirmation of a financial action, produced by the component
+least equipped to make that claim.
+
+Reasoning:
+
+- The most consequential sentence a user can type must not depend on a probabilistic
+  classifier being in a good mood.
+- A named function that always raises makes the absence of ordering assertable by a test
+  rather than assumed from the absence of code.
+- Recording the confirmation before refusing keeps ADR-026's gate real: when ordering is
+  eventually implemented, the approval step already exists and is already versioned.
+
+Tradeoffs:
+
+- The keyword set is English and will miss unusual phrasing; those fall through to
+  semantic interpretation, where the system prompt still forbids claiming an order.
+- "confirm" is claimed by the gate even in states where nothing is pending, so the reply
+  explains what to do instead.
+
+Consequences:
+
+- Tests assert that no module outside `checkout.py` mentions `place_order`, that
+  `amazon.py` exposes no cart or ordering function, and that `agent.py` never references
+  `PLACING_ORDER` or `COMPLETED`.
+- Every confirmed summary states plainly that no order was submitted.
+
+---
+
+## ADR-050 — A Candidate Is Identified by Its Amazon Product, Not Its Position
+
+Status: Accepted and implemented
+
+Decision:
+
+`candidate_id` is derived from the ASIN in the product URL, falling back to a stable hash
+of that URL. It is no longer the result's position in a search.
+
+Context:
+
+Ids were `amazon-result-{index}`. In a conversation with two searches, the first result of
+the second search reused `amazon-result-1` and merged into the unrelated line already on
+the list: adding a t-shirt silently increased the quantity of a shampoo. This was found by
+role-playing a multi-item conversation, not by the unit tests, which only ever searched once.
+
+Reasoning:
+
+- Identity must come from the thing itself. Amazon already provides one in the ASIN.
+- A stable id makes "the same product found twice" merge correctly, which is the behaviour
+  a cart should have.
+- A URL hash keeps ids stable across restarts for listings without a `/dp/` path.
+
+Consequences:
+
+- Cart lines, selection, and removal all key off Amazon's product identity.
+- Persisted workflows written before this change carry position-based ids; they remain
+  readable (ADR-041) and are replaced on the next search.

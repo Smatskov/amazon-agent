@@ -22,8 +22,23 @@ class ReplyIntent(StrEnum):
     AFFIRM = "affirm"
     DECLINE = "decline"
     CANCEL = "cancel"
+    CHECKOUT = "checkout"
+    CONFIRM_ORDER = "confirm_order"
     SELECT_POSITION = "select_position"
     NONE = "none"
+
+
+# Asking to buy must always reach the agent's own confirmation gate, which refuses.
+# Routing this phrasing through a language model risks a reply that claims an order
+# was placed, so it is matched here before any model is consulted.
+CONFIRM_INTENT = re.compile(
+    r"\b(?:place|submit|send|finalise|finalize|complete)\s+(?:the\s+|my\s+|this\s+)?order\b"
+    r"|\border\s+(?:it|them|this|that|now)\b"
+    r"|\bbuy\s+(?:it|them|this|that|now)\b"
+    r"|\bpurchase\s+(?:it|them|this|that)\b"
+    r"|\bconfirm\b"
+)
+CHECKOUT_INTENT = re.compile(r"\bcheck\s?out\b")
 
 
 AFFIRM_WORDS = frozenset(
@@ -63,6 +78,10 @@ def interpret(message: str, candidates: list[Candidate]) -> WorkflowReply:
 
     if normalized in CANCEL_PHRASES:
         return WorkflowReply(ReplyIntent.CANCEL)
+    if CONFIRM_INTENT.search(normalized):
+        return WorkflowReply(ReplyIntent.CONFIRM_ORDER)
+    if CHECKOUT_INTENT.search(normalized):
+        return WorkflowReply(ReplyIntent.CHECKOUT)
     if normalized in AFFIRM_PHRASES:
         return WorkflowReply(ReplyIntent.AFFIRM)
 

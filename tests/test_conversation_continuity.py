@@ -143,7 +143,7 @@ def test_option_number_selects_without_calling_the_model(paths, monkeypatch):
     _run("buy AA batteries", paths)
     reply = _run("3", paths)
 
-    assert "Selected Rayovac AA Batteries, 4 Count" in reply
+    assert "Added Rayovac AA Batteries, 4 Count" in reply
     assert interpret.await_count == 1
     workflow = workflow_store.get_workflow(USER, paths[1])
     assert workflow.selected_candidate_id == workflow.candidates[2].candidate_id
@@ -167,7 +167,7 @@ def test_bare_yes_with_a_single_candidate_selects_it(paths, monkeypatch):
     _run("buy AA batteries", paths)
     reply = _run("yes", paths)
 
-    assert "Selected Duracell Coppertop AA Batteries, 24 Count" in reply
+    assert "Added Duracell Coppertop AA Batteries, 24 Count" in reply
 
 
 def test_unclassified_reply_repeats_the_question_rather_than_answering_something_else(paths, monkeypatch):

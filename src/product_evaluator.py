@@ -9,7 +9,7 @@ from llm_client import generate_response
 import ranking
 from request_context import RequestContext
 from response_policy import PRODUCT_EVALUATION_MAX_TOKENS, PRODUCT_EVALUATION_SYSTEM_PROMPT
-from workflow_models import Candidate
+from workflow_models import Candidate, CartLine
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +40,22 @@ def candidate_context(candidates: list[Candidate]) -> str:
             }
             for index, candidate in enumerate(candidates, start=1)
             for unit in [ranking.unit_price(candidate)]
+        ]
+    )
+
+
+def cart_context(lines: list[CartLine]) -> str:
+    """Serialize the user's list so conversation about it cannot contradict it."""
+    return json.dumps(
+        [
+            {
+                "position": index,
+                "title": line.title,
+                "quantity": line.quantity,
+                "price": line.price_text,
+                "line_total": line.line_total,
+            }
+            for index, line in enumerate(lines, start=1)
         ]
     )
 

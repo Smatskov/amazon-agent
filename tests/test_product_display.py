@@ -36,17 +36,41 @@ def _candidate(title, price=None, price_text=None, rating=None, reviews=None, pr
         (
             "Sensodyne Pronamel Gentle Whitening Toothpaste for Sensitive Teeth, "
             "to Reinforce and Protect Enamel, Alpine Breeze - 4 Ounces (Pack of 3)",
-            "Sensodyne Pronamel Gentle Whitening Toothpaste for Sensitive Teeth, Pack of 3",
+            "Sensodyne Pronamel Gentle Whitening Toothpaste for Sensitive Teeth, "
+            "Alpine Breeze, 4 Ounces, Pack of 3",
+        ),
+        # Colour and size identify the variant and must survive shortening.
+        (
+            "Jockey Men's Classic Crew Neck T-Shirt, White, Medium, 3 Pack",
+            "Jockey Men's Classic Crew Neck T-Shirt, White, Medium, 3 Pack",
+        ),
+        (
+            "Jockey Men's Cotton Stretch V-Neck Undershirt White Medium 2 Pack",
+            "Jockey Men's Cotton Stretch V-Neck Undershirt White Medium 2 Pack",
         ),
         ("Short Title", "Short Title"),
     ],
 )
-def test_display_title_keeps_brand_product_and_pack_size(raw, expected):
+def test_display_title_keeps_brand_product_and_variant_facts(raw, expected):
     assert product_display.display_title(raw) == expected
 
 
+def test_display_title_drops_marketing_copy_but_not_variant_facts():
+    raw = (
+        "BrandCo Ultra Premium Advanced Hydrating Daily Facial Moisturizer Cream Lotion "
+        "Formula, clinically proven to restore and protect your skin barrier overnight, "
+        "Unscented, 8 Ounces"
+    )
+
+    result = product_display.display_title(raw)
+
+    assert "clinically proven" not in result
+    assert "Unscented" in result
+    assert "8 Ounces" in result
+
+
 def test_display_title_marks_truncation_instead_of_silently_dropping_words():
-    raw = "One Two Three Four Five Six Seven Eight Nine Ten Eleven"
+    raw = " ".join(f"Word{index}" for index in range(20))
 
     assert product_display.display_title(raw).endswith("…")
 

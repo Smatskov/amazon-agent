@@ -27,10 +27,11 @@ CHEAPEST_MARKERS = ("cheapest", "cheaper", "lowest price", "least expensive")
 HIGHEST_RATED_MARKERS = ("highest rated", "highest-rated", "best rated", "best reviewed", "best rating")
 # Ordinary conversational filler that never identifies a specific product.
 STOP_WORDS = frozenset(
-    """a an and buy choice choose do for get give go i ill im it item just lets let me my number
-    of ok okay one option order pick please select sure take thanks that the then this to want
-    with yes yeah yep""".split()
+    """a an and buy choice choose delete do drop for from get give go i ill im instead it item
+    just lets let list me my number of off ok okay one option order pick please remove select
+    sure take thanks that the then this to want with yes yeah yep actually cart""".split()
 )
+PLURAL_ES = ("ses", "xes", "zes", "ches", "shes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,15 +108,28 @@ def _bare_position(lower: str, count: int) -> int | None:
     return valid.pop() if len(valid) == 1 else None
 
 
-def _described_candidates(lower: str, candidates: list[Candidate]) -> list[Candidate]:
-    """Match candidates by the significant words the user actually typed."""
+def _singular(word: str) -> str:
+    """Fold a simple plural so "t shirts" can match "T-Shirt"."""
+    if word.endswith(PLURAL_ES):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _significant_tokens(text: str) -> set[str]:
     # Numbers of any length are kept because pack counts ("10 count", "3 pack") are
     # how users identify a specific variant.
-    tokens = {
-        token
-        for token in re.findall(r"[a-z0-9]+", lower)
+    return {
+        _singular(token)
+        for token in re.findall(r"[a-z0-9]+", text)
         if (len(token) >= 3 or token.isdigit()) and token not in STOP_WORDS
     }
+
+
+def _described_candidates(lower: str, candidates: list[Candidate]) -> list[Candidate]:
+    """Match candidates by the significant words the user actually typed."""
+    tokens = _significant_tokens(lower)
     if not tokens:
         return []
 
@@ -124,7 +138,7 @@ def _described_candidates(lower: str, candidates: list[Candidate]) -> list[Candi
         haystack = candidate.title.casefold()
         if candidate.brand:
             haystack = f"{haystack} {candidate.brand.casefold()}"
-        words = set(re.findall(r"[a-z0-9]+", haystack))
+        words = {_singular(word) for word in re.findall(r"[a-z0-9]+", haystack)}
         scores.append((len(tokens & words), candidate))
 
     best = max(score for score, _ in scores)

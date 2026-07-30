@@ -119,28 +119,41 @@ def test_active_workflow_actions_are_validated_before_state_changes(tmp_path, mo
     interpret = AsyncMock(side_effect=[
         _purchase(),
         intent_classifier.SemanticAction("workflow", "change_quantity", 0.99, quantity=2),
-        intent_classifier.SemanticAction("workflow", "confirm", 0.99),
     ])
     monkeypatch.setattr(agent.intent_classifier, "interpret_message", interpret)
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
     asyncio.run(agent.agent_brain("Buy toothpaste", memory_path, workflow_path, 3))
-    assert "quantity to 2" in asyncio.run(agent.agent_brain("two", memory_path, workflow_path, 3))
-    assert "Selected" in asyncio.run(agent.agent_brain("the first one", memory_path, workflow_path, 3))
-    assert "not available" in asyncio.run(agent.agent_brain("confirm", memory_path, workflow_path, 3))
+    assert "quantity of 2" in asyncio.run(agent.agent_brain("two", memory_path, workflow_path, 3))
+    assert "Added" in asyncio.run(agent.agent_brain("the first one", memory_path, workflow_path, 3))
+    assert "checkout" in asyncio.run(agent.agent_brain("confirm", memory_path, workflow_path, 3))
     assert "Cancelled" in asyncio.run(agent.agent_brain("cancel", memory_path, workflow_path, 3))
 
     assert workflow_store.get_active_workflow(3, workflow_path) is None
-    assert interpret.await_count == 3
+    # Only "two" and the opening request need the model; the rest are deterministic.
+    assert interpret.await_count == 2
 
 
-def test_new_purchase_is_not_started_while_a_workflow_is_active(tmp_path, monkeypatch):
+def test_a_second_search_reuses_the_workflow_and_keeps_the_list(tmp_path, monkeypatch):
+    """Shopping is iterative: asking for a second product must not be refused."""
     memory_path, workflow_path = tmp_path / "memory.db", tmp_path / "workflows.db"
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(side_effect=[_purchase("toothpaste"), _purchase("shampoo")]))
+    # "the first one" resolves deterministically and never reaches the model.
+    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(side_effect=[
+        _purchase("toothpaste"),
+        _purchase("shampoo"),
+    ]))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
+
     asyncio.run(agent.agent_brain("Buy toothpaste", memory_path, workflow_path, 3))
+    asyncio.run(agent.agent_brain("the first one", memory_path, workflow_path, 3))
     response = asyncio.run(agent.agent_brain("Buy shampoo", memory_path, workflow_path, 3))
-    assert "already have" in response
+
+    assert "already have" not in response
+    assert "Amazon results" in response
+    assert "Still on your list: 1 item(s)" in response
+    workflow = workflow_store.get_active_workflow(3, workflow_path)
+    assert workflow.normalized_product_goal == "shampoo"
+    assert len(workflow.cart) == 1
 
 
 def test_every_state_change_advances_the_persisted_state_version(tmp_path, monkeypatch):

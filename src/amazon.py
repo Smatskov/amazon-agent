@@ -181,19 +181,24 @@ def browser_profile_dir() -> Path:
 
 
 def _browser_headless() -> bool:
-    """Visible browsing is the safe default; headless mode is explicit only."""
-    return os.getenv("AMAZON_BROWSER_HEADLESS", "false").strip().casefold() == "true"
+    """Search runs in the background by default.
+
+    A window flashing open on every Telegram message is poor UX. Headless is a
+    display choice only: the same persistent profile and the same session are used,
+    and no bot protection is bypassed. Set AMAZON_BROWSER_HEADLESS=false to watch.
+    """
+    return os.getenv("AMAZON_BROWSER_HEADLESS", "true").strip().casefold() != "false"
 
 
 @asynccontextmanager
-async def _persistent_browser_context():
+async def _persistent_browser_context(*, headless: bool | None = None):
     """Open the configured Chromium profile without altering its Amazon session."""
     profile = browser_profile_dir()
     profile.parent.mkdir(parents=True, exist_ok=True)
     async with async_playwright() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             str(profile),
-            headless=_browser_headless(),
+            headless=_browser_headless() if headless is None else headless,
             viewport={"width": 1440, "height": 1000},
         )
         try:
@@ -209,7 +214,8 @@ async def _persistent_browser_context():
 
 async def open_profile_for_manual_sign_in() -> None:
     """Open Amazon visibly and wait for the user to complete any manual sign-in."""
-    async with _persistent_browser_context() as context:
+    # Always visible regardless of configuration: this step exists to be used by a human.
+    async with _persistent_browser_context(headless=False) as context:
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(AMAZON_HOME_URL, wait_until="domcontentloaded", timeout=30_000)
         print(

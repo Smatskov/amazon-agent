@@ -11,7 +11,20 @@ from timing import RequestTiming
 
 ROUTES = {"memory", "purchase", "workflow", "general_chat", "unknown"}
 MEMORY_ACTIONS = {"remember", "recall", "forget"}
-WORKFLOW_ACTIONS = {"select_candidate", "change_quantity", "refine", "cancel", "confirm"}
+WORKFLOW_ACTIONS = {
+    "select_candidate",
+    "add_to_cart",
+    "remove_from_cart",
+    "view_cart",
+    "change_quantity",
+    "refine",
+    "checkout",
+    "confirm",
+    "cancel",
+}
+# Actions a quantity may accompany. It is required by change_quantity and optional for
+# the two cart actions; every other action must carry none.
+QUANTITY_ACTIONS = {"change_quantity", "add_to_cart", "remove_from_cart"}
 MIN_ACTION_CONFIDENCE = 0.65
 SEMANTIC_OUTPUT_TOKENS = 256
 
@@ -111,8 +124,12 @@ def _workflow_prompt(message: str, workflow_summary: str, pending_question: str 
     return (
         "Return exactly one JSON object. No markdown, explanation, or reasoning. "
         "Interpret a reply to the active preview purchase workflow with action, quantity, "
-        "constraints, confidence. action is select_candidate, change_quantity, refine, cancel, confirm, or no_match. "
-        "quantity is a positive integer only for change_quantity, otherwise null. constraints is an object. "
+        "constraints, confidence. action is select_candidate, add_to_cart, remove_from_cart, "
+        "view_cart, change_quantity, refine, checkout, confirm, cancel, or no_match. "
+        "select_candidate=choosing an option; add_to_cart=adding it to the basket; "
+        "checkout=asking to check out; confirm=approving the final order summary. "
+        "quantity is a positive integer for change_quantity, optional for add_to_cart and "
+        "remove_from_cart, and null otherwise. constraints is an object. "
         "Do not answer or execute anything. "
         f"Workflow: {workflow_summary}. Pending question: {pending_question or 'none'}. Message: {message}"
     )
@@ -188,8 +205,9 @@ def _workflow_action(data: dict[str, Any] | None) -> SemanticAction:
         return _no_match()
     if action == "no_match" or confidence < MIN_ACTION_CONFIDENCE:
         return SemanticAction("workflow")
-    # A quantity is required by change_quantity and forbidden everywhere else.
-    if (action == "change_quantity") != (quantity is not None):
+    if action == "change_quantity" and quantity is None:
+        return _no_match()
+    if action not in QUANTITY_ACTIONS and quantity is not None:
         return _no_match()
     return SemanticAction("workflow", action, confidence, constraints=constraints, quantity=quantity)
 

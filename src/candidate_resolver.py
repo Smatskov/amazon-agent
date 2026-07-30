@@ -22,7 +22,9 @@ ORDINAL_WORDS = {
 }
 # An explicit reference such as "option 5", "number 5", "#5", or "no. 5".
 EXPLICIT_POSITION = re.compile(r"\b(?:option|number|no\.?|choice|item)\s*#?\s*(\d+)\b|#\s*(\d+)\b")
-BARE_NUMBER = re.compile(r"\b(\d+)\b")
+# A minus sign creates a word boundary, so "-1" used to read as position 1.
+BARE_NUMBER = re.compile(r"(?<![\d\-–—])(\d+)\b")
+NUMBER_ONLY = re.compile(r"^[-+]?\d+[.!]?$")
 CHEAPEST_MARKERS = ("cheapest", "cheaper", "lowest price", "least expensive")
 HIGHEST_RATED_MARKERS = ("highest rated", "highest-rated", "best rated", "best reviewed", "best rating")
 # Ordinary conversational filler that never identifies a specific product.
@@ -65,6 +67,14 @@ def resolve_candidate_reference(message: str, candidates: list[Candidate]) -> Ca
     position = explicit_position(lower, len(candidates))
     if position is not None:
         return CandidateResolution(candidates[position - 1])
+
+    # A message that is only a number is a position attempt and nothing else. Falling
+    # through would let "-1" or "9" match a digit inside a product title.
+    if NUMBER_ONLY.match(lower):
+        return CandidateResolution(
+            None,
+            f"There are {len(candidates)} options. Reply with a number from 1 to {len(candidates)}.",
+        )
 
     described = _described_candidates(lower, candidates)
     if described:

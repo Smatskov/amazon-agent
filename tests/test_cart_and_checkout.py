@@ -191,6 +191,74 @@ def test_cart_writes_can_be_switched_off(monkeypatch):
         asyncio.run(amazon.add_to_cart("https://www.amazon.com/dp/B079GXSFPB"))
 
 
+def test_a_click_that_does_not_change_the_cart_is_reported_as_a_failure(monkeypatch):
+    """A variation page shows an Add to Cart button that does nothing until a size is
+    chosen. Live testing found this reported success for a cart that never changed."""
+    import amazon
+    import asyncio
+
+    monkeypatch.setenv("AMAZON_ENABLE_CART", "true")
+    counts = iter([0, 0, 0, 0])  # never increases
+
+    class Locator:
+        def __init__(self, count=1):
+            self._count = count
+
+        async def count(self):
+            return self._count
+
+        @property
+        def first(self):
+            return self
+
+        async def get_attribute(self, name):
+            return amazon.ADD_TO_CART_BUTTON_ID if name == "id" else None
+
+        async def click(self):
+            return None
+
+        async def select_option(self, value):
+            return None
+
+    class Page:
+        url = "https://www.amazon.com/dp/B0TEST"
+
+        def locator(self, selector):
+            return Locator()
+
+        async def goto(self, *args, **kwargs):
+            return None
+
+        async def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        async def close(self):
+            return None
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+    class Manager:
+        async def __aenter__(self):
+            return Context()
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(amazon, "_persistent_browser_context", lambda **kw: Manager())
+    monkeypatch.setattr(amazon, "_cart_count", lambda page: _next(counts))
+
+    results = asyncio.run(amazon.add_many_to_cart([("https://www.amazon.com/dp/B0TEST", 1)]))
+
+    assert results[0].added is False
+    assert "did not confirm" in results[0].detail
+
+
+async def _next(counts):
+    return next(counts, 0)
+
+
 def test_add_to_cart_refuses_a_non_canonical_url(monkeypatch):
     import amazon
     import asyncio

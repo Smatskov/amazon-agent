@@ -475,6 +475,70 @@ CART_PRICE_SELECTOR = ".sc-item-price-block .a-price .a-offscreen"
 CART_DELETE_SELECTOR = "input[value='Delete']"
 
 
+@dataclass(frozen=True, slots=True)
+class CartWriteResult:
+    """What actually happened for one item, so nothing is reported as guessed."""
+
+    url: str
+    quantity: int
+    added: bool
+    detail: str | None = None
+
+
+async def add_many_to_cart(items: list[tuple[str, int]]) -> list[CartWriteResult]:
+    """Add several products in one browser session.
+
+    One item failing must not abandon the rest, and every result reports what really
+    happened rather than assuming the click worked.
+    """
+    if not cart_writes_enabled():
+        raise AmazonCartUnavailable("Cart writes are disabled (AMAZON_ENABLE_CART=false).")
+
+    results: list[CartWriteResult] = []
+    async with _persistent_browser_context() as context:
+        page = await context.new_page()
+        try:
+            for url, quantity in items:
+                try:
+                    if not _is_amazon_product_url(url):
+                        raise AmazonCartUnavailable("Not a canonical Amazon product URL.")
+                    _refuse_ordering_url(url)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+                    button = page.locator(f"#{ADD_TO_CART_BUTTON_ID}")
+                    if not await button.count():
+                        raise AmazonCartUnavailable("No Add to Cart control on this page.")
+                    if await button.first.get_attribute("id") != ADD_TO_CART_BUTTON_ID:
+                        raise AmazonCartUnavailable("Unexpected control id; refusing to click.")
+                    if quantity > 1:
+                        selector = page.locator("#quantity")
+                        if await selector.count():
+                            try:
+                                await selector.first.select_option(str(min(quantity, 30)))
+                            except Exception:
+                                pass
+                    before = await _cart_count(page)
+                    await button.first.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                    _refuse_ordering_url(page.url)
+                    # A click that raises nothing is not proof. A variation page shows
+                    # an Add to Cart button that does nothing until a size or scent is
+                    # chosen, which previously reported success for an empty cart.
+                    after = await _cart_count(page)
+                    if after is None or (before is not None and after <= before):
+                        raise AmazonCartUnavailable(
+                            "Amazon did not confirm the item reached the cart; it may "
+                            "need a size or colour chosen first."
+                        )
+                    results.append(CartWriteResult(url, quantity, True))
+                except Exception as error:  # noqa: BLE001 - one failure must not stop the rest
+                    results.append(CartWriteResult(url, quantity, False, str(error)[:120]))
+            count = await _cart_count(page)
+            print(f"[AMAZON] add_many_to_cart added={sum(r.added for r in results)} cart_count={count}")
+        finally:
+            await page.close()
+    return results
+
+
 async def read_cart() -> list[Product]:
     """Read the real Amazon cart. Read-only; never proceeds to checkout."""
     async with _persistent_browser_context() as context:

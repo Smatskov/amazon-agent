@@ -143,6 +143,10 @@ def _looks_like_shopping_request(message: str) -> bool:
 
 
 CLARIFICATION_QUESTION = "Which product should I search for on Amazon?"
+RESET_COMMAND = re.compile(
+    r"^(?:/)?(?:reset|start over|start again|clear|clear (?:my )?list|"
+    r"forget everything|new search|wipe)[.!]?$"
+)
 
 
 def _ask_what_to_search(
@@ -184,7 +188,7 @@ def _reask_pending_question(workflow: PurchaseWorkflow) -> str:
     return workflow.pending_question or CLARIFICATION_QUESTION
 
 
-def _apply_workflow_reply(
+async def _apply_workflow_reply(
     workflow: PurchaseWorkflow,
     reply: workflow_reply.WorkflowReply,
     workflow_database_path: str | Path,
@@ -195,7 +199,7 @@ def _apply_workflow_reply(
         return _cancel_workflow(workflow, workflow_database_path)
     # Order and checkout phrasing is answered by the gate itself, never by the model.
     if reply.intent is workflow_reply.ReplyIntent.CONFIRM_ORDER:
-        return _confirm_order(workflow, workflow_database_path)
+        return await _confirm_order(workflow, workflow_database_path)
     if reply.intent is workflow_reply.ReplyIntent.CHECKOUT:
         return _begin_checkout(workflow, workflow_database_path)
     if reply.intent is workflow_reply.ReplyIntent.COMPARE:
@@ -215,7 +219,7 @@ def _apply_workflow_reply(
     if workflow.state == WorkflowState.AWAITING_CHECKOUT_CONFIRMATION:
         # "yes" here means approving an order, so it must reach the gate itself.
         if reply.intent is workflow_reply.ReplyIntent.AFFIRM:
-            return _confirm_order(workflow, workflow_database_path)
+            return await _confirm_order(workflow, workflow_database_path)
         if reply.intent is workflow_reply.ReplyIntent.DECLINE:
             workflow_store.transition(
                 workflow,
@@ -442,24 +446,66 @@ def _begin_checkout(workflow: PurchaseWorkflow, workflow_database_path: str | Pa
     return product_display.present_checkout(summary)
 
 
-def _confirm_order(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
-    """The confirmation gate. It records approval and then refuses to order."""
+async def _confirm_order(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
+    """The confirmation gate.
+
+    Confirming is the user's explicit approval, so it is the one point where the real
+    Amazon cart is written. It stops there: the order itself is never submitted.
+    """
     if workflow.state != WorkflowState.AWAITING_CHECKOUT_CONFIRMATION:
         if not workflow.cart:
             return "There is nothing to confirm yet. Pick something first."
         return "Say 'checkout' first so I can show you the exact summary to confirm."
 
     workflow.confirmed_token = checkout.confirmation_token(workflow)
-    workflow_store.save_workflow(workflow, workflow_database_path)
     summary = checkout.summarize(workflow)
     subtotal = "unknown" if summary.subtotal is None else f"${summary.subtotal:.2f}"
-    return (
-        f"Confirmed: {summary.item_count} item(s), items subtotal {subtotal}.\n\n"
-        "I cannot place this order. Ordering is deliberately not implemented — there is "
-        "no code path in this agent that can submit a purchase to Amazon, by design.\n\n"
-        "Your list is saved, so open Amazon yourself to buy these. "
-        "Say 'cancel' when you're done."
+    header = f"Confirmed: {summary.item_count} item(s), items subtotal {subtotal}."
+
+    transfer = await _push_to_amazon_cart(workflow)
+    workflow_store.transition(
+        workflow,
+        WorkflowState.PAUSED,
+        pending_question="Open Amazon to complete the order.",
     )
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return (
+        f"{header}\n\n{transfer}\n\n"
+        "I cannot place this order. Ordering is deliberately not implemented — no code "
+        "path here can submit a purchase. Open Amazon to complete it.\n\n"
+        "Say 'reset' to start something new."
+    )
+
+
+async def _push_to_amazon_cart(workflow: PurchaseWorkflow) -> str:
+    """Move the approved list into the user's real Amazon cart, reporting reality."""
+    items = [
+        (line.source_url, line.quantity) for line in workflow.cart if line.source_url
+    ]
+    if not items:
+        return "Nothing on the list had an Amazon link, so I could not add anything."
+    try:
+        results = await amazon.add_many_to_cart(items)
+    except amazon.AmazonCartUnavailable as error:
+        return f"I could not add these to your Amazon cart ({error}). The list is saved."
+    except Exception as error:  # noqa: BLE001 - the reply must never be an exception
+        print(f"Amazon cart error: {error}")
+        return "I couldn't reach your Amazon cart just now. The list is saved."
+
+    added = [result for result in results if result.added]
+    failed = [result for result in results if not result.added]
+    lines = [
+        f"Added {len(added)} of {len(results)} item(s) to your real Amazon cart."
+        if added
+        else "I could not add anything to your Amazon cart."
+    ]
+    for result in failed:
+        title = next(
+            (line.title for line in workflow.cart if line.source_url == result.url),
+            result.url,
+        )
+        lines.append(f"• Not added: {product_display.display_title(title)} ({result.detail})")
+    return "\n".join(lines)
 
 
 async def _general_response(message: str, workflow: PurchaseWorkflow | None = None) -> str:
@@ -494,6 +540,23 @@ async def _general_response(message: str, workflow: PurchaseWorkflow | None = No
     return normalize_general_response(response)
 
 
+_USER_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _user_lock(telegram_user_id: int) -> asyncio.Lock:
+    """One lock per user so a burst of messages is handled in order.
+
+    Telegram delivers updates concurrently. Without this, two quick messages both read
+    the workflow, both modify it, and the second save silently discards the first --
+    losing an item the user just added.
+    """
+    lock = _USER_LOCKS.get(telegram_user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _USER_LOCKS[telegram_user_id] = lock
+    return lock
+
+
 async def agent_brain(
     message: str,
     memory_database_path: str | Path | None = None,
@@ -501,6 +564,18 @@ async def agent_brain(
     telegram_user_id: int = 0,
 ) -> str:
     """Coordinate a complete model response without exposing LM Studio to Telegram."""
+    async with _user_lock(telegram_user_id):
+        return await _handle_message(
+            message, memory_database_path, workflow_database_path, telegram_user_id
+        )
+
+
+async def _handle_message(
+    message: str,
+    memory_database_path: str | Path | None,
+    workflow_database_path: str | Path | None,
+    telegram_user_id: int,
+) -> str:
     timing = RequestTiming.start()
     # Storage locations are resolved per call, not bound at import, so tests and
     # future deployments can redirect them without rewriting the entry point.
@@ -519,6 +594,19 @@ async def agent_brain(
         if command == "invalid":
             return MEMORY_USAGE
         return _memory_response(command, key, value, memory_database_path)
+
+    if RESET_COMMAND.match(message.strip().casefold()):
+        # Always available, never routed through the model, so the user can always
+        # get back to a clean slate no matter what state the conversation is in.
+        existing = workflow_store.get_active_workflow(telegram_user_id, workflow_database_path)
+        if existing:
+            workflow_store.transition(existing, WorkflowState.CANCELLED)
+            workflow_store.save_workflow(existing, workflow_database_path)
+        return (
+            "Reset. Your list here is cleared and I've forgotten the current search.\n\n"
+            "Anything already in your Amazon cart stays there — remove it on Amazon if "
+            "you don't want it. What would you like to look for?"
+        )
 
     search_query = _search_query(message)
     if search_query is not None:
@@ -541,7 +629,7 @@ async def agent_brain(
         reply = workflow_reply.interpret(message, active_workflow.candidates)
         if reply.is_confident:
             print(f"[ROUTING] deterministic workflow reply intent={reply.intent}")
-            return _apply_workflow_reply(
+            return await _apply_workflow_reply(
                 active_workflow, reply, workflow_database_path, message
             )
 
@@ -597,7 +685,7 @@ async def agent_brain(
                 existing=active_workflow,
             )
         if active_workflow and semantic_action.route == "workflow" and semantic_action.action != "no_match":
-            return _continue_purchase_workflow(active_workflow, semantic_action, message, workflow_database_path)
+            return await _continue_purchase_workflow(active_workflow, semantic_action, message, workflow_database_path)
         if _is_awaiting_clarification(active_workflow) and semantic_action.route != "general_chat":
             # The agent asked what to search for, so this reply is the answer.
             return await _start_purchase_workflow(
@@ -776,7 +864,7 @@ async def _start_purchase_workflow(
     return results
 
 
-def _continue_purchase_workflow(
+async def _continue_purchase_workflow(
     workflow: PurchaseWorkflow,
     action: intent_classifier.SemanticAction,
     message: str,
@@ -794,7 +882,7 @@ def _continue_purchase_workflow(
     if action.action == "checkout":
         return _begin_checkout(workflow, workflow_database_path)
     if action.action == "confirm":
-        return _confirm_order(workflow, workflow_database_path)
+        return await _confirm_order(workflow, workflow_database_path)
     if action.action == "change_quantity":
         return _change_quantity(workflow, action, message, workflow_database_path)
 

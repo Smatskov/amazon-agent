@@ -152,15 +152,53 @@ def test_no_module_calls_place_order():
     assert callers == []
 
 
-def test_amazon_boundary_exposes_no_ordering_capability():
+def test_amazon_boundary_can_add_to_cart_but_never_order():
+    """Cart writes are authorised; ordering is not, and must stay absent."""
     import amazon
 
     implemented = {
         name for name in dir(amazon) if not name.startswith("_") and callable(getattr(amazon, name))
     }
-    forbidden = {"add_to_cart", "place_order", "place_confirmed_order", "checkout", "buy_now"}
 
-    assert implemented & forbidden == set()
+    assert "add_to_cart" in implemented
+    assert implemented & {"place_order", "place_confirmed_order", "buy_now", "submit_order", "checkout"} == set()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.amazon.com/gp/buy/spc/handlers/display.html",
+        "https://www.amazon.com/checkout/entry",
+        "https://www.amazon.com/gp/cart/desktop/go-to-checkout.html",
+    ],
+)
+def test_ordering_urls_are_refused(url):
+    import amazon
+
+    with pytest.raises(amazon.AmazonCartUnavailable):
+        amazon._refuse_ordering_url(url)
+
+
+def test_cart_writes_can_be_switched_off(monkeypatch):
+    import amazon
+
+    monkeypatch.setenv("AMAZON_ENABLE_CART", "false")
+    assert amazon.cart_writes_enabled() is False
+
+    with pytest.raises(amazon.AmazonCartUnavailable):
+        import asyncio
+
+        asyncio.run(amazon.add_to_cart("https://www.amazon.com/dp/B079GXSFPB"))
+
+
+def test_add_to_cart_refuses_a_non_canonical_url(monkeypatch):
+    import amazon
+    import asyncio
+
+    monkeypatch.setenv("AMAZON_ENABLE_CART", "true")
+
+    with pytest.raises(amazon.AmazonCartUnavailable):
+        asyncio.run(amazon.add_to_cart("https://evil.example.com/dp/B0TEST"))
 
 
 def test_workflow_never_reaches_a_placing_order_state():

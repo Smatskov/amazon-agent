@@ -25,7 +25,17 @@ class ReplyIntent(StrEnum):
     CHECKOUT = "checkout"
     CONFIRM_ORDER = "confirm_order"
     SELECT_POSITION = "select_position"
+    COMPARE = "compare"
     NONE = "none"
+
+
+# Words the agent itself offers must work without asking the model first. Routing
+# "cheapest" through a 4B classifier meant a `no_match` reply re-offered the very
+# word it had just ignored.
+COMPARISON_ONLY = re.compile(
+    r"^(?:the\s+)?(?:cheapest|cheaper|lowest\s+price|least\s+expensive"
+    r"|highest\s+rated|best\s+rated|best\s+reviewed|top\s+rated)(?:\s+one|\s+option)?$"
+)
 
 
 # Asking to buy must always reach the agent's own confirmation gate, which refuses.
@@ -82,6 +92,8 @@ def interpret(message: str, candidates: list[Candidate]) -> WorkflowReply:
         return WorkflowReply(ReplyIntent.CONFIRM_ORDER)
     if CHECKOUT_INTENT.search(normalized):
         return WorkflowReply(ReplyIntent.CHECKOUT)
+    if candidates and COMPARISON_ONLY.match(normalized):
+        return WorkflowReply(ReplyIntent.COMPARE)
     if normalized in AFFIRM_PHRASES:
         return WorkflowReply(ReplyIntent.AFFIRM)
 

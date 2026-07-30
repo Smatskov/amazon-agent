@@ -3,9 +3,11 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from html import unescape
 from html.parser import HTMLParser
 import os
 from pathlib import Path
+import re
 from typing import Protocol
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlparse
 
@@ -43,6 +45,7 @@ class Product:
     review_count: int | None = None
     availability: str | None = None
     prime_eligible: bool | None = None
+    delivery: str | None = None
 
 
 class AmazonSearchUnavailable(RuntimeError):
@@ -51,6 +54,41 @@ class AmazonSearchUnavailable(RuntimeError):
 
 class AmazonProfileConfigurationError(RuntimeError):
     """The persistent browser profile is unsafe or unavailable."""
+
+
+class AmazonCartUnavailable(RuntimeError):
+    """The cart operation could not be completed safely."""
+
+
+# Cart writes touch a real account, so the control that may be clicked is named
+# exactly, never matched loosely. An id selector cannot resolve to "Buy Now".
+ADD_TO_CART_BUTTON_ID = "add-to-cart-button"
+CART_URL = "https://www.amazon.com/gp/cart/view.html"
+CART_COUNT_SELECTOR = "#nav-cart-count"
+# Any URL that could begin an order. Navigation to these is refused outright.
+ORDERING_URL_FRAGMENTS = (
+    "/gp/buy/",
+    "/checkout",
+    "buy-now",
+    "go-to-checkout",
+    "/gp/cart/desktop/go-to-checkout",
+    "spc/handlers/display.html",
+)
+
+
+def cart_writes_enabled() -> bool:
+    """Cart writes can be switched off without changing code."""
+    return os.getenv("AMAZON_ENABLE_CART", "true").strip().casefold() != "false"
+
+
+def _refuse_ordering_url(url: str) -> None:
+    """Never navigate anywhere that could start or submit an order."""
+    lowered = url.casefold()
+    for fragment in ORDERING_URL_FRAGMENTS:
+        if fragment in lowered:
+            raise AmazonCartUnavailable(
+                f"Refusing to navigate to an order URL: {fragment}"
+            )
 
 
 class AmazonWorkflowGateway(Protocol):
@@ -152,6 +190,17 @@ class _AmazonResultCardParser(HTMLParser):
         return None
 
 
+RATINGS_ARIA = re.compile(r'aria-label="([\d,]+)\s+ratings?"')
+DELIVERY_DATE = re.compile(
+    r"(?:FREE delivery|delivery|Delivery|Get it|arrives)\D{0,20}"
+    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2})"
+)
+# A "Join Prime" upsell means this account is not a Prime member, so a Prime badge
+# would be misleading rather than helpful.
+PRIME_UPSELL = re.compile(r"join prime", re.IGNORECASE)
+
+
 def _result_metadata_from_html(html: str) -> tuple[str | None, float | None, int | None, bool | None]:
     """Read only visible pricing and rating metadata from one result-card fragment.
 
@@ -160,12 +209,35 @@ def _result_metadata_from_html(html: str) -> tuple[str | None, float | None, int
     """
     parser = _AmazonResultCardParser()
     parser.feed(html)
+    # Amazon abbreviates the visible count ("(212.1K)") but keeps the exact number in
+    # the accessibility label, so the label is the reliable source.
+    ratings = RATINGS_ARIA.search(html)
+    review_count = (
+        _review_count_from_text(ratings.group(1))
+        if ratings
+        else _review_count_from_text(parser.first_value("review_count"))
+    )
+    prime = True if parser.prime_eligible and not PRIME_UPSELL.search(html) else None
     return (
         parser.first_value("price"),
         _rating_from_text(parser.first_value("rating")),
-        _review_count_from_text(parser.first_value("review_count")),
-        True if parser.prime_eligible else None,
+        review_count,
+        prime,
     )
+
+
+HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _delivery_from_html(html: str) -> str | None:
+    """Return a delivery date only when Amazon states one on the card.
+
+    Tags are stripped first: the date sits inside its own span, so matching against
+    raw markup put 20+ characters of attributes between the label and the date.
+    """
+    text = unescape(HTML_TAG.sub(" ", html))
+    match = DELIVERY_DATE.search(" ".join(text.split()))
+    return match.group(1).strip() if match else None
 
 
 def browser_profile_dir() -> Path:
@@ -314,6 +386,7 @@ async def _search_in_context(context, query: str) -> list[Product]:
                 rating=rating,
                 review_count=review_count,
                 prime_eligible=prime_eligible,
+                delivery=_delivery_from_html(card_html),
             )
             seen_urls.add(url)
             products.append(product)
@@ -322,6 +395,135 @@ async def _search_in_context(context, query: str) -> list[Product]:
         raise AmazonSearchUnavailable(
             "Amazon did not load a usable search page before the timeout."
         ) from error
+
+
+async def _cart_count(page) -> int | None:
+    """Read the header cart badge, which is how success is confirmed."""
+    try:
+        text = await page.locator(CART_COUNT_SELECTOR).first.get_attribute("aria-label")
+        if text:
+            digits = re.search(r"\d+", text)
+            if digits:
+                return int(digits.group())
+        raw = await page.locator(CART_COUNT_SELECTOR).first.text_content()
+        return int((raw or "").strip()) if (raw or "").strip().isdigit() else None
+    except Exception:
+        return None
+
+
+async def add_to_cart(product_url: str, quantity: int = 1, *, visible: bool = False) -> int | None:
+    """Add one product to the real Amazon cart. Never begins or submits an order.
+
+    Returns the cart count after the click when Amazon reports one, so the caller can
+    confirm the write really happened instead of assuming it did.
+    """
+    if not cart_writes_enabled():
+        raise AmazonCartUnavailable("Cart writes are disabled (AMAZON_ENABLE_CART=false).")
+    if not _is_amazon_product_url(product_url):
+        raise AmazonCartUnavailable("Refusing a non-canonical Amazon product URL.")
+    _refuse_ordering_url(product_url)
+
+    async with _persistent_browser_context(headless=None if not visible else False) as context:
+        page = await context.new_page()
+        try:
+            await page.goto(product_url, wait_until="domcontentloaded", timeout=25_000)
+            before = await _cart_count(page)
+
+            button = page.locator(f"#{ADD_TO_CART_BUTTON_ID}")
+            if not await button.count():
+                raise AmazonCartUnavailable(
+                    "No Add to Cart control on this page; it may be unavailable or a variation picker."
+                )
+            # Defence in depth: confirm the resolved element is the intended control.
+            resolved_id = await button.first.get_attribute("id")
+            if resolved_id != ADD_TO_CART_BUTTON_ID:
+                raise AmazonCartUnavailable(f"Unexpected control id {resolved_id!r}; refusing to click.")
+
+            if quantity > 1:
+                selector = page.locator("#quantity")
+                if await selector.count():
+                    try:
+                        await selector.first.select_option(str(min(quantity, 30)))
+                    except Exception:
+                        print("[AMAZON] quantity selector rejected the value; adding one")
+
+            await button.first.click()
+            await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+            _refuse_ordering_url(page.url)
+            after = await _cart_count(page)
+            print(f"[AMAZON] add_to_cart cart_count before={before} after={after}")
+            if after is None:
+                raise AmazonCartUnavailable("Could not confirm the item reached the cart.")
+            return after
+        finally:
+            await page.close()
+
+
+CART_ROW_SELECTOR = "[data-asin][data-itemid], .sc-list-item[data-asin]"
+CART_PRICE_SELECTOR = ".sc-item-price-block .a-price .a-offscreen"
+CART_DELETE_SELECTOR = "input[value='Delete']"
+
+
+async def read_cart() -> list[Product]:
+    """Read the real Amazon cart. Read-only; never proceeds to checkout."""
+    async with _persistent_browser_context() as context:
+        page = await context.new_page()
+        try:
+            await page.goto(CART_URL, wait_until="domcontentloaded", timeout=25_000)
+            _refuse_ordering_url(page.url)
+            rows = page.locator(CART_ROW_SELECTOR)
+            items: list[Product] = []
+            for index in range(await rows.count()):
+                row = rows.nth(index)
+                title = await _text_or_none(
+                    row.locator(".sc-product-title, .a-truncate-full").first
+                )
+                price = await _text_or_none(row.locator(CART_PRICE_SELECTOR).first)
+                asin = await row.get_attribute("data-asin")
+                if title:
+                    items.append(
+                        Product(
+                            title=title,
+                            price=price,
+                            url=f"https://www.amazon.com/dp/{asin}" if asin else CART_URL,
+                        )
+                    )
+            return items
+        finally:
+            await page.close()
+
+
+async def remove_from_cart(asin: str, *, visible: bool = False) -> int | None:
+    """Remove one item from the real Amazon cart by ASIN.
+
+    Only the Delete control inside the matching cart row may be clicked, and the URL is
+    re-checked afterwards so a mis-click cannot land on a checkout page unnoticed.
+    """
+    if not cart_writes_enabled():
+        raise AmazonCartUnavailable("Cart writes are disabled (AMAZON_ENABLE_CART=false).")
+    if not re.fullmatch(r"[A-Za-z0-9]{6,14}", asin or ""):
+        raise AmazonCartUnavailable(f"Refusing an implausible ASIN: {asin!r}")
+
+    async with _persistent_browser_context(headless=None if not visible else False) as context:
+        page = await context.new_page()
+        try:
+            await page.goto(CART_URL, wait_until="domcontentloaded", timeout=25_000)
+            _refuse_ordering_url(page.url)
+            row = page.locator(f"{CART_ROW_SELECTOR}").filter(has=page.locator(f"[data-asin='{asin}']"))
+            target = page.locator(f"[data-asin='{asin}']").first
+            if not await target.count():
+                raise AmazonCartUnavailable(f"{asin} is not in the cart.")
+            delete = target.locator(CART_DELETE_SELECTOR).first
+            if not await delete.count():
+                raise AmazonCartUnavailable("No Delete control in that cart row.")
+            await delete.click()
+            await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+            _refuse_ordering_url(page.url)
+            remaining = await _cart_count(page)
+            print(f"[AMAZON] remove_from_cart asin={asin} cart_count_after={remaining}")
+            return remaining
+        finally:
+            await page.close()
 
 
 async def search_products(query: str) -> list[Product]:

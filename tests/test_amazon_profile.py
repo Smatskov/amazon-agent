@@ -168,6 +168,60 @@ def test_representative_amazon_search_html_extracts_only_visible_product_fields(
     assert prime_eligible is True
 
 
+def test_variation_count_is_not_mistaken_for_a_price():
+    """Variation listings put "2 scents" in the first offscreen span, before the price."""
+    html = """
+    <div data-asin="B0VAR">
+      <a class="a-link-normal s-line-clamp-3" href="/dp/B0VAR"><span>Shampoo</span></a>
+      <span class="a-offscreen">2 scents</span>
+      <span class="a-price"><span class="a-offscreen">$12.47</span></span>
+    </div>
+    """
+
+    price, _, _, _ = amazon._result_metadata_from_html(html)
+
+    assert price == "$12.47"
+
+
+def test_review_count_comes_from_the_accessibility_label():
+    """The visible count is abbreviated ("(212.1K)"); the label carries the real number."""
+    html = (
+        '<div data-asin="B0R"><a class="a-link-normal s-line-clamp-3" href="/dp/B0R">'
+        '<span>Item</span></a>'
+        '<a aria-label="212,162 ratings" class="s-underline-text"><span>(212.1K)</span></a></div>'
+    )
+
+    _, _, review_count, _ = amazon._result_metadata_from_html(html)
+
+    assert review_count == 212162
+
+
+def test_prime_is_not_claimed_when_amazon_shows_a_join_prime_upsell():
+    html = (
+        '<div data-asin="B0P"><a class="a-link-normal s-line-clamp-3" href="/dp/B0P">'
+        '<span>Item</span></a><i class="a-icon-prime"></i>'
+        '<span class="prime-brand-color">Join Prime</span></div>'
+    )
+
+    _, _, _, prime = amazon._result_metadata_from_html(html)
+
+    assert prime is None
+
+
+def test_delivery_date_survives_the_tags_between_label_and_date():
+    html = (
+        '<div class="udm-secondary-delivery-message">Or Non-members get '
+        '<span class="a-text-bold">FREE delivery</span> '
+        '<span class="a-text-bold">Tue, Aug 4</span> on $35 of items</div>'
+    )
+
+    assert amazon._delivery_from_html(html) == "Tue, Aug 4"
+
+
+def test_delivery_is_none_when_amazon_states_no_date():
+    assert amazon._delivery_from_html("<div>Usually ships within a month</div>") is None
+
+
 def test_result_metadata_reports_absent_fields_as_none_instead_of_guessing():
     html = '<div data-asin="B0BARE"><h2><a href="/dp/B0BARE">Plain Item</a></h2></div>'
 

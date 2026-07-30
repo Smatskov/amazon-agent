@@ -26,7 +26,14 @@ class ReplyIntent(StrEnum):
     CONFIRM_ORDER = "confirm_order"
     SELECT_POSITION = "select_position"
     COMPARE = "compare"
+    SHOW_OPTIONS = "show_options"
     NONE = "none"
+
+
+SHOW_OPTIONS = re.compile(
+    r"^(?:show me |show |see |what are )?(?:the )?"
+    r"(?:options|other options|alternatives|all of them|everything|the list|other ones)$"
+)
 
 
 # Words the agent itself offers must work without asking the model first. Routing
@@ -92,6 +99,8 @@ def interpret(message: str, candidates: list[Candidate]) -> WorkflowReply:
         return WorkflowReply(ReplyIntent.CONFIRM_ORDER)
     if CHECKOUT_INTENT.search(normalized):
         return WorkflowReply(ReplyIntent.CHECKOUT)
+    if candidates and SHOW_OPTIONS.match(normalized):
+        return WorkflowReply(ReplyIntent.SHOW_OPTIONS)
     if candidates and COMPARISON_ONLY.match(normalized):
         return WorkflowReply(ReplyIntent.COMPARE)
     if normalized in AFFIRM_PHRASES:

@@ -47,6 +47,7 @@ class Candidate:
     title: str
     brand: str | None
     price: float | None
+    # As Amazon stated it on the card, e.g. "Tue, Aug 4". Never inferred.
     delivery_label: str | None = None
     rating: float | None = None
     option_label: str = "Amazon result"

@@ -36,7 +36,7 @@ def test_validated_purchase_starts_preview_workflow_only(tmp_path, monkeypatch):
     monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(return_value=_purchase()))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
     memory_path, workflow_path = tmp_path / "memory.db", tmp_path / "workflows.db"
-    response = asyncio.run(agent.agent_brain("Buy toothpaste", memory_path, workflow_path, 41))
+    response = asyncio.run(agent.agent_brain("find me toothpaste", memory_path, workflow_path, 41))
     workflow = workflow_store.get_active_workflow(41, workflow_path)
     assert "Amazon results" in response
     assert workflow is not None
@@ -144,9 +144,9 @@ def test_a_second_search_reuses_the_workflow_and_keeps_the_list(tmp_path, monkey
     ]))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    asyncio.run(agent.agent_brain("Buy toothpaste", memory_path, workflow_path, 3))
+    asyncio.run(agent.agent_brain("find me toothpaste", memory_path, workflow_path, 3))
     asyncio.run(agent.agent_brain("the first one", memory_path, workflow_path, 3))
-    response = asyncio.run(agent.agent_brain("Buy shampoo", memory_path, workflow_path, 3))
+    response = asyncio.run(agent.agent_brain("find me shampoo", memory_path, workflow_path, 3))
 
     assert "already have" not in response
     assert "Amazon results" in response

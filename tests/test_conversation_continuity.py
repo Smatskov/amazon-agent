@@ -153,7 +153,7 @@ def test_bare_yes_with_several_candidates_asks_which_one(paths, monkeypatch):
     _mock_semantic(monkeypatch, _purchase("AA batteries"))
     _mock_amazon(monkeypatch, count=3)
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     reply = _run("yes", paths)
 
     assert "still on your search" in reply

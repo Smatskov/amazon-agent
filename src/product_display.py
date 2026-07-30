@@ -77,6 +77,8 @@ def candidate_facts(candidate: Candidate) -> str:
         if candidate.review_count is not None:
             rating += f" ({candidate.review_count:,} reviews)"
         facts.append(rating)
+    if candidate.delivery_label:
+        facts.append(f"arrives {candidate.delivery_label}")
     if candidate.prime_eligible:
         facts.append("Prime")
     return " — ".join(facts)
@@ -164,6 +166,28 @@ def present_candidates(
         blocks.append(" ".join(notes))
 
     blocks.append(f"{PREVIEW_DISCLAIMER}\n{next_step_hint(candidates)}")
+    return "\n\n".join(blocks)
+
+
+def present_recommendation(goal: str, recommendation, total_found: int) -> str:
+    """Name one pick and why, and ask before adding anything."""
+    candidate = recommendation.candidate
+    reasons = "; ".join(recommendation.reasons)
+    blocks = [
+        f'For "{goal}" I\'d pick this out of {total_found} result'
+        f'{_plural(total_found)}:',
+        f"{display_title(candidate.title)}\n{candidate_facts(candidate)}",
+        f"Why: {reasons}.",
+    ]
+    if recommendation.runner_up is not None:
+        blocks.append(
+            f"Runner-up: {display_title(recommendation.runner_up.title)} — "
+            f"{candidate_facts(recommendation.runner_up)}"
+        )
+    blocks.append(
+        'Reply "yes" to add it to your list, "options" to see everything I found, '
+        'or name something else.'
+    )
     return "\n\n".join(blocks)
 
 

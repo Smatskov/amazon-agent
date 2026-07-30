@@ -5,6 +5,7 @@ import json
 from time import perf_counter
 from typing import Any, Callable
 
+import examples
 from llm_client import generate_response
 from timing import RequestTiming
 
@@ -85,8 +86,12 @@ def _valid_quantity(value: Any) -> bool:
 
 
 def _router_prompt(message: str, workflow_summary: str, pending_question: str | None) -> str:
+    # Curated examples raise routing accuracy on a small local model without adding a
+    # second call. The corpus is human-maintained and never written to by the agent.
+    guidance = examples.prompt_block(message)
     return (
-        "Return exactly one JSON object. No markdown, explanation, or reasoning. "
+        (f"{guidance}\n" if guidance else "")
+        + "Return exactly one JSON object. No markdown, explanation, or reasoning. "
         "Route this message: {\"route\":\"memory|purchase|workflow|general_chat|unknown\","
         "\"confidence\":0.0}. Do not answer, use tools, or infer fields. "
         "memory=stored personal facts; purchase=starting a product request; "

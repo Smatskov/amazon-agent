@@ -189,8 +189,19 @@ class _AmazonResultCardParser(HTMLParser):
                 return cleaned
         return None
 
+    def first_matching(self, field: str, pattern: re.Pattern[str]) -> str | None:
+        """First value of a field that actually looks like the thing being read."""
+        for value in self._values.get(field, []):
+            cleaned = value.strip()
+            if cleaned and pattern.search(cleaned):
+                return cleaned
+        return None
+
 
 RATINGS_ARIA = re.compile(r'aria-label="([\d,]+)\s+ratings?"')
+# Variation listings put a count such as "2 scents" in the first offscreen span, so a
+# price must be recognised by shape rather than by being first.
+PRICE_SHAPED = re.compile(r"[$£€]\s?\d")
 DELIVERY_DATE = re.compile(
     r"(?:FREE delivery|delivery|Delivery|Get it|arrives)\D{0,20}"
     r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
@@ -219,7 +230,7 @@ def _result_metadata_from_html(html: str) -> tuple[str | None, float | None, int
     )
     prime = True if parser.prime_eligible and not PRIME_UPSELL.search(html) else None
     return (
-        parser.first_value("price"),
+        parser.first_matching("price", PRICE_SHAPED),
         _rating_from_text(parser.first_value("rating")),
         review_count,
         prime,

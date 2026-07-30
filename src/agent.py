@@ -17,6 +17,7 @@ import product_display
 import product_evaluator
 import ranking
 from request_context import RequestContext
+import request_mode
 from response_policy import (
     GENERAL_RESPONSE_MAX_TOKENS,
     PURCHASING_AGENT_SYSTEM_PROMPT,
@@ -199,6 +200,11 @@ def _apply_workflow_reply(
         return _begin_checkout(workflow, workflow_database_path)
     if reply.intent is workflow_reply.ReplyIntent.COMPARE:
         return _resolve_or_research(workflow, message, workflow_database_path)
+    if reply.intent is workflow_reply.ReplyIntent.SHOW_OPTIONS:
+        ranked = ranking.RankedCandidates(workflow.candidates, ranking.PREVIOUS_ORDER)
+        return product_display.present_candidates(
+            workflow.normalized_product_goal, ranked
+        )
 
     if _is_awaiting_clarification(workflow):
         # A bare yes or no is not a product name, so the question still stands.
@@ -227,6 +233,10 @@ def _apply_workflow_reply(
             workflow, workflow.candidates[reply.position - 1], workflow_database_path
         )
     if reply.intent is workflow_reply.ReplyIntent.AFFIRM:
+        # "yes" accepts a pick the agent already named, or the only option there is.
+        pending = _last_referenced_candidate(workflow)
+        if pending and not cart.find(workflow.cart, pending.candidate_id):
+            return _select_candidate(workflow, pending, workflow_database_path)
         if len(workflow.candidates) == 1:
             return _select_candidate(workflow, workflow.candidates[0], workflow_database_path)
         return _reask_pending_question(workflow)
@@ -669,6 +679,7 @@ def _candidates_from_products(products: list[amazon.Product]) -> list[Candidate]
             title=product.title,
             brand=None,
             price=_price_amount(product.price),
+            delivery_label=product.delivery,
             rating=product.rating,
             price_text=product.price,
             review_count=product.review_count,
@@ -733,6 +744,23 @@ async def _start_purchase_workflow(
         pending_question="Which candidate would you like?",
     )
     workflow_store.save_workflow(workflow, workflow_database_path)
+
+    if request_mode.classify(message) is request_mode.RequestMode.COMMAND:
+        # An instruction asks for a decision, so name one pick and confirm before
+        # adding. The full list stays one word away.
+        recommendation = ranking.recommend(ranked.candidates, message)
+        if recommendation:
+            workflow.selected_candidate_id = recommendation.candidate.candidate_id
+            workflow_store.transition(
+                workflow,
+                WorkflowState.AWAITING_PRODUCT_SELECTION,
+                pending_question="Add this one?",
+            )
+            workflow_store.save_workflow(workflow, workflow_database_path)
+            return product_display.present_recommendation(
+                goal, recommendation, len(ranked.candidates)
+            )
+
     results = product_display.present_candidates(
         goal, ranked, removed=outcome.removed, removal_reasons=outcome.reasons
     )

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import amazon
 import product_evaluator
 from request_context import RequestContext
+from response_policy import PRODUCT_EVALUATION_MAX_TOKENS, PRODUCT_EVALUATION_SYSTEM_PROMPT
 
 
 def test_request_context_records_current_search_facts_only():
@@ -52,6 +53,10 @@ def test_evaluator_uses_structured_products_without_searching_amazon(monkeypatch
     assert "Prime eligibility only when it is provided" in prompt
     assert '"title": "Reliable AA Batteries"' in prompt
     assert '"prime_eligible": true' in prompt
+    assert generate_response.await_args.kwargs == {
+        "max_tokens": PRODUCT_EVALUATION_MAX_TOKENS,
+        "system_prompt": PRODUCT_EVALUATION_SYSTEM_PROMPT,
+    }
 
 
 def test_evaluator_flags_reorder_style_request_without_history_access(monkeypatch):

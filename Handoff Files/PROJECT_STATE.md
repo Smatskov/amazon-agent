@@ -1,299 +1,173 @@
 # Amazon AI Purchasing Agent — Project State
 
-Last updated: 2026-07-27
+Last updated: 2026-07-30
 
-Status: Active development
+Status: Active development with a dirty, uncommitted worktree. The conversational preview loop is now complete end to end in automated tests: clarify → search → filter → rank → present → answer questions → refine → select → cancel. Cart, checkout, checkout confirmation, and order placement remain unimplemented and unreachable.
 
-Current milestone: The agent classifies natural-language intent through LM Studio, validates structured intent before agent-owned routing, and preserves explicit memory/search commands as aliases. Purchasing automation has not started.
+This is the current implementation handoff. Historic decisions remain append-only in `Handoff Files/DECISIONS.md` (ADR-001 through ADR-046).
 
-This document is the current source of truth for starting a new project conversation. It describes the repository as it exists now, not historical implementation details.
+## What is verified, and what is not
 
-## 1. Project Mission
+Verified in this session (automated level only):
 
-Build a personal AI purchasing agent controlled through Telegram. The long-term goal is for the user to send a natural-language purchasing request, have the agent apply preferences and safety rules, eventually search and evaluate Amazon products, and report the outcome through Telegram.
+- **185 tests pass** (`.venv/bin/python -m pytest -q`), up from 96. Syntax, imports, and `git diff --check` also pass.
+- The full preview conversation was exercised against mocked LM Studio and mocked Amazon and its user-visible output inspected directly, not only asserted by substring.
+- Deterministic behavior with no model call: option numbers, `yes`, `no`, and `cancel` while a workflow is active.
+- Deterministic ranking: a cheap request orders by price per item, falls back to total price when a pack size is missing, and states which basis it used.
 
-The current milestone is deliberately much smaller: a Telegram message reaches a local language model through LM Studio and the completed answer returns to Telegram.
+Not verified or not implemented:
 
-## 2. Hardware and Environment
+- **No live verification was performed in this session.** LM Studio, Amazon, and Telegram were not contacted at any point. No bot was started and no live probe script was run.
+- No manual Telegram conversation has confirmed the new behavior end to end. This is the main outstanding gap.
+- No cart, checkout preview, price-total confirmation, payment, ordering, order-history lookup, or purchase-history storage exists. **No code path in this repository can place an order.** `amazon.py` exposes only `search_products()` and a manual sign-in helper; `AmazonWorkflowGateway` is a `Protocol` with no implementation and no callers.
+- Amazon delivery estimates and availability are still not extracted; product-detail pages are not fetched.
+- Searches still open a visible browser window.
 
-- Development machine: Apple Silicon Mac with 8 GB unified memory.
-- Local model runtime: LM Studio.
-- Selected development model: `Qwen3.5-4B-MLX-4bit`.
-- Verified LM Studio model identifier: `qwen3.5-4b-mlx`.
-- Python virtual environment: `.venv/` using Python 3.13.14.
-- Project location: `~/amazon-agent`.
+Verified previously and unchanged: LM Studio serves `qwen3.5-4b-mlx` with the corrected Qwen template; semantic routing uses strict compact JSON with typed validation and soft/hard timeouts; the model executes no memory, browser, workflow, or purchase action; read-only Amazon search against a manually signed-in persistent profile returns canonical product records.
 
-The 8 GB unified-memory limit is important. The selected 4-bit 4B model leaves more practical headroom than a larger model for macOS, LM Studio, the Telegram bot, and later browser automation.
-
-## 3. Current Verified Architecture
-
-```text
-Telegram user
-    ↓
-main.py
-    ↓
-agent.py
-    ├── explicit memory/search aliases → existing memory or search route
-    └── natural-language message → intent_classifier.py → validated IntentResult
-                                      ├── memory intent → memory.py → SQLite
-                                      ├── search intent → amazon.py → Playwright Chromium → Amazon public search results
-                                      │                    ↓ structured `Product` objects
-                                      │                RequestContext → product_evaluator.py → llm_client.py
-                                      ├── reorder/buy intent → safe non-executing response
-                                      └── general/unknown → llm_client.py → LM Studio OpenAI-compatible local API
-                                                                            ↓
-                                                                    Qwen3.5-4B-MLX-4bit
-```
-
-LM Studio successfully loads the selected model. Its OpenAI-compatible local API runs at the configured `LLM_BASE_URL`. Telegram-to-local-model-to-Telegram inference has been verified end to end.
-
-The OpenAI Python SDK is used only as a client for LM Studio's OpenAI-compatible local API. This project does not use it as an OpenAI cloud-model dependency.
-
-The classifier determines only what the user wants; it cannot access tools, memory, Amazon, or Telegram. Its structured output is validated before `agent.py` routes it, and `agent.py` remains responsible for every route. Explicit memory/search commands remain supported aliases. Search continues to use the isolated browser tool, then a `RequestContext` and structured facts flow to `product_evaluator.py`.
-
-## 4. Exact Current Module Responsibilities
-
-### `src/main.py` — Telegram boundary and startup
-
-- Loads Telegram configuration from the environment.
-- Starts the Telegram application and registers the text-message handler.
-- Rejects messages from users other than the configured authorized user.
-- Logs sender and message metadata to the terminal.
-- Sends the initial `Thinking…` placeholder.
-- Calls `agent_brain()` and displays the completed response.
-- Splits a completed response into 4,096-character Telegram-safe sections when necessary. The original placeholder becomes the first section; remaining sections are sent as additional messages only after generation is complete.
-
-### `src/agent.py` — orchestration boundary
-
-- Provides `agent_brain(message)` as the application-level agent entry point.
-- Preserves explicit, case-insensitive `remember:`, `recall:`, `forget:`, and `search:` commands as aliases.
-- Routes valid memory instructions to `memory.py` and returns deterministic responses without calling LM Studio.
-- Rejects malformed memory instructions with usage guidance.
-- Calls `intent_classifier.py` for all non-alias messages, then validates and routes its `IntentResult`.
-- Routes natural memory intents to the existing memory functions and natural search intents to the existing read-only search flow.
-- Returns safe, non-executing responses for classified reorder and buy intents.
-- Creates a `RequestContext` with only the confirmed current search fields, then passes it with structured results to `product_evaluator.py`.
-- Returns the evaluator recommendation exactly as before; evaluator metadata does not change Telegram behavior.
-- Delegates all other messages to `generate_response()` exactly as before.
-- Logs underlying model/server errors to the terminal.
-- Returns a friendly user-facing error message when the local model cannot be reached or fails.
-
-### `src/llm_client.py` — language-model communication boundary
-
-- Loads `LLM_BASE_URL` and `LLM_MODEL` from environment configuration instead of hardcoding them.
-- Creates the existing `AsyncOpenAI` client with LM Studio as its base URL and a 60-second timeout.
-- Sends a normal, non-streaming chat completion request.
-- Returns stripped visible `message.content` only; reasoning fields are not shown to Telegram users.
-- Raises a clear error for missing or whitespace-only visible model output.
-
-### `src/memory.py` — local memory storage boundary
-
-- Uses Python's built-in `sqlite3` module for simple string key/value storage.
-- Provides `remember()`, `recall()`, and `forget()`.
-- Defaults to `data/memory.db`, while accepting a database-path argument for isolated use and tests.
-- Creates and queries its SQLite table internally; no other module contains its SQL or setup details.
-- Is called only by `agent.py` for explicit and classified natural-language memory instructions.
-
-### `src/amazon.py` — Amazon browser-tool boundary
-
-- Owns every Amazon interaction through Playwright; no other module imports or controls browser automation.
-- Exposes async `search_products(query: str)`, which launches headless Chromium, opens Amazon public search results, and returns up to five visible `Product` dataclasses.
-- Returns only the initial structured fields: title, price, URL, optional rating, optional review count, optional availability, and Prime eligibility when visible.
-- Does not sign in, add products to a cart, begin checkout, purchase, scrape reviews, or write any storage.
-
-### `src/product_evaluator.py` — product-comparison boundary
-
-- Accepts a `RequestContext` and structured `amazon.Product` objects.
-- Builds a fact-bounded comparison prompt and communicates only with `llm_client.generate_response()`.
-- Asks the local model to compare price, rating, review count, availability, Prime eligibility when provided, value for money, and likely fit.
-- Requires reasoning, tradeoffs, a top choice, and a budget alternative when appropriate.
-- Returns `EvaluationResult` with recommendation text and a metadata-only reorder-style-request signal. It does not access order history, invent prior products, or change user-visible behavior.
-- Does not interact with Telegram, Amazon, Playwright, storage, cart, checkout, or purchasing.
-
-### `src/request_context.py` — request-metadata boundary
-
-- Defines immutable `RequestContext` for shared orchestration facts: original user request, intent, search query, confidence, confirmation requirement, and an optional future order-history candidate.
-- The current search route populates only the applicable request, intent, query, and routing-confidence fields. Confirmation is false and the future order-history candidate remains unset.
-
-### `src/intent_classifier.py` — intent-classification boundary
-
-- Sends a schema-bound classification request to LM Studio through `llm_client.generate_response()`.
-- Returns validated `IntentResult` records containing only intent metadata; it never executes tools, accesses memory, accesses Amazon, or makes recommendations.
-- Supports `general_chat`, `memory_remember`, `memory_recall`, `memory_forget`, `amazon_search`, `amazon_reorder`, `amazon_buy`, and `unknown` intents.
-- Safely falls back to `general_chat` for malformed, invalid, or unavailable classification responses. Low-confidence actionable intents are downgraded to `unknown`.
-
-## 5. Current Repository Structure
-
-### Verified files and directories
+## Actual runtime call flow
 
 ```text
-amazon-agent/
-├── .env                       # Exists; ignored; never inspect or commit secret values
-├── .env.example               # Lists all required variable names without values
-├── .gitignore
-├── .venv/                     # Local Python virtual environment; ignored
-├── Handoff Files/
-│   ├── PROJECT_STATE.md
-│   └── DECISIONS.md
-├── README.md                  # Present but currently empty
-├── requirements-dev.txt        # Pinned development test dependency
-├── pytest.ini                 # Lets pytest import modules from src/
-├── src/
-│   ├── main.py
-│   ├── agent.py
-│   ├── llm_client.py
-│   ├── memory.py
-│   ├── amazon.py
-│   ├── product_evaluator.py
-│   ├── request_context.py
-│   └── intent_classifier.py
-├── config/                    # Present; no tracked project files verified inside
-├── data/                      # Present; no tracked project files verified inside
-└── tests/
-    ├── test_agent_memory_commands.py
-    ├── test_complete_response_flow.py
-    ├── test_intent_classifier.py
-    ├── test_memory.py
-    └── test_product_evaluator.py
+Telegram Update
+  → src/main.py: authorization, metadata-only log, “Thinking…”, final reply/edit
+  → src/agent.py
+
+1. explicit colon aliases
+     remember:/recall:/forget:  → memory.py            → data/memory.db
+     search: <query>            → amazon.py            → product_evaluator.py → LM Studio prose
+
+2. deterministic workflow reply (only when a workflow is active)
+     workflow_reply.py → cancel / select position / affirm / decline   [no model call]
+
+3. semantic interpretation
+     intent_classifier.py → llm_client.py → validated SemanticAction
+       ├─ memory action    → memory.py
+       ├─ purchase start   → amazon.py → Candidate conversion
+       │                     → ranking.apply_constraints → ranking.rank
+       │                     → workflow_store.py → product_display.py
+       ├─ workflow action  → refine  → ranking (re-filter/re-order stored results)
+       │                   → select  → candidate_resolver.py
+       │                   → cancel / change_quantity / confirm
+       └─ general/unknown
+
+4. pending-question fallback → re-ask instead of answering something unrelated
+
+5. general conversation → response_policy.py + llm_client.py,
+     with product_evaluator.candidate_context() supplying the options on screen
 ```
 
-`requirements-dev.txt` is the current development dependency manifest. No production dependency manifest was found (`requirements.txt`, `pyproject.toml`, `Pipfile`, `poetry.lock`, and `uv.lock` are absent).
+Important actual-path distinctions:
 
-### Planned but not implemented
+- `product_evaluator.evaluate_products()` is **not** called by the natural-language purchase path. It is active only through the explicit `search:` alias.
+- Candidates are persisted in displayed order, so a reply of "3" always means the third line shown.
+- A refinement re-filters and re-orders results already retrieved; it does not run a second Amazon search.
+- `timing.py` measures the semantic path. Explicit aliases and deterministic workflow replies return before the semantic task and produce no full timing record.
 
-- Preference-storage design beyond explicit key/value commands.
-- Product evaluation beyond the initial fact-bounded local-model comparison.
-- Natural-language intent extraction quality and manual verification of classifications.
-- Amazon order-history lookup and reorder workflows; only non-executable TODO integration placeholders exist today.
-- Amazon login, cart, checkout, purchase execution, and order-status handling.
-- Configuration validation at startup.
-- A production dependency manifest.
-- Production reliability features such as health checks, structured logs, and automatic restart.
+## Production module inventory
 
-## 6. Installed Dependencies That Were Verified
+| Module | Lines | Lifecycle | Responsibility | Safety boundary / limitation |
+| --- | --- | --- | --- | --- |
+| `main.py` | 83 | Active entry point | Telegram transport, authorization, startup configuration validation, 4,096-character sectioning. | Logs only user ID and message length. Authorization fails closed: an unset ID becomes `0`, matching no user. |
+| `agent.py` | 569 | Active orchestrator | Routing, workflow decisions, and the only action executor. | Sole action executor. Database paths resolve per call. Purchase work is read-only search plus preview state. |
+| `llm_client.py` | 138 | Active LM Studio boundary | OpenAI-compatible communication with LM Studio. | Prefers visible content; accepts `reasoning_content` only when it parses as exactly one JSON object. **Known duplication:** two near-parallel request paths (streaming when timed, non-streaming otherwise). |
+| `intent_classifier.py` | 250 | Active semantic interpreter | Router then specialist, returning a validated `SemanticAction`. | Validators are pure functions over parsed JSON. No tool, storage, Telegram, or browser access. |
+| `workflow_reply.py` | 87 | Active deterministic interpreter (**new**) | Reads unambiguous replies to the agent's own question without a model call. | Deliberately strict: every significant word must belong to one vocabulary, or it defers to the model. Returns an intent only; executes nothing. |
+| `ranking.py` | 164 | Active decision policy (**new**) | Hard constraint filtering and inspectable ordering, as pure functions. | Never invents a value to sort by. A candidate missing the compared fact is kept and listed last, and the basis plus any caveat are reported to the user. |
+| `product_display.py` | 122 | Active presentation (**new**) | Concise display titles, fact lines, candidate-aware next-step hints, spaced Telegram output. | Shortens and arranges stored facts; adds none. Enforces the preview disclaimer on every candidate message. |
+| `candidate_resolver.py` | 149 | Active selection helper | Resolves comparisons, positions, and described words against stored candidates. | Zero or ambiguous matches produce clarification and never guess. Lenient by design: only reached after the model classified a selection. |
+| `memory.py` | 55 | Active persistence | Explicit key/value memory. | No preference inference, purchase history, or model-controlled write path. |
+| `amazon.py` | 329 | Active read-only browser boundary | Playwright persistent-context search and public-result extraction. | Rejects repository-local profile paths and advertising URLs. `AmazonWorkflowGateway` is a type-only future interface with no implementation. |
+| `product_evaluator.py` | 91 | Active on two narrow paths | `evaluate_products()` for the `search:` alias; `candidate_context()` serializes stored candidates for conversation. | **Mismatch:** evaluator prose reaches Telegram unvalidated on the alias path; no deterministic fact-claim checker exists. |
+| `workflow_models.py` | 115 | Active model | Typed workflow and candidate records. | Excludes payment data, cookies, and addresses. Deserializes field-tolerantly (ADR-041). |
+| `workflow_store.py` | 107 | Active persistence | One workflow per user; `transition()` is the only state-change path. | Enforces expiry after 24 hours (ADR-046). Does not yet reject illegal transitions. |
+| `timing.py` | 96 | Active diagnostics | Request-scoped latency measurement. | Observability only; never alters routing. |
+| `response_policy.py` | 46 | Active prompt policy | System prompts, token limits, sentence-safe normalization. | Separates conversational and product-fact contracts. |
+| `request_context.py` | 15 | Active on the alias path | Immutable request metadata. | `requires_confirmation` and `future_order_history_candidate` remain unset placeholders. |
 
-The following packages were verified with `.venv/bin/python -m pip show` on 2026-07-24:
+## Test coverage map
 
-- `openai` 2.47.0 — OpenAI-compatible client used to call LM Studio locally.
-- `python-telegram-bot` 22.8 — Telegram integration.
-- `python-dotenv` 1.2.2 — loads local environment configuration.
-- `pydantic` 2.13.4 — installed dependency; not yet used by the current source modules.
-- `playwright` 1.61.0 — used by `amazon.py` for the initial read-only Chromium search tool.
-- `pytest` 9.1.1 — development test runner, pinned in `requirements-dev.txt`.
+Last verified full run: **185 passed**. All external boundaries mocked; temporary SQLite throughout; `tests/conftest.py` makes writing to `data/` structurally impossible.
 
-## 7. Environment Configuration
+| Test file | Tests | Responsibility covered |
+| --- | --- | --- |
+| `tests/test_workflow_reply.py` | 35 | Affirmatives, refusals, cancellations, explicit positions, out-of-range numbers, empty candidate lists, and the mixed sentences that must defer to the model. |
+| `tests/test_ranking.py` | 23 | Pack-count reading, unit price, sort-preference detection, unit vs total price fallback, missing prices and ratings, tie-breaking by review count, and constraint filtering that drops only proven violations. |
+| `tests/test_candidate_resolution.py` | 20 | Numeric and ordinal selection, natural brand references, pack-count variants, comparisons, ambiguity, out-of-range numbers, empty lists, and missing facts. |
+| `tests/test_conversation_continuity.py` | 18 | Clarifying question answered by the next message, unclassified answers still used, general chat not hijacking a pending question, refusal closing the workflow, deterministic selection, single-candidate confirmation, question answering with candidate facts, refinement narrowing and reordering, refinement matching nothing, and workflow expiry. |
+| `tests/test_complete_response_flow.py` | 14 | LM Studio content handling, JSON-mode request shape, guarded reasoning fallback, empty responses, graceful model-error text, Telegram sectioning. |
+| `tests/test_product_display.py` | 13 | Display-title shortening and pack-size preservation, truncation marking, fact lines, candidate-aware hints, spacing, filter and caveat notes, empty result sets. |
+| `tests/test_agent_memory_commands.py` | 12 | Explicit memory aliases, validated semantic memory actions, whole-word shopping markers, clarification persistence, semantic timeouts, `search:` delegation. |
+| `tests/test_intent_classifier.py` | 11 | Router-then-specialist prompting, token budget, route/action validation, confidence handling, scalar constraints, general-chat short circuit. |
+| `tests/test_amazon_profile.py` | 10 | Profile configuration, visible default, bounded close, result-card metadata, absent fields, query-tab reuse, canonical URL filtering, selector regression. |
+| `tests/test_purchase_workflow.py` | 10 | Preview start, real-record conversion, Amazon failure safety, legacy mock invalidation, workflow actions, state-version advancement, tolerant deserialization, workflow isolation. |
+| `tests/test_semantic_evaluation_corpus.py` | 7 | Offline semantic-contract corpus. |
+| `tests/test_memory.py` | 6 | SQLite memory behavior and persistence. |
+| `tests/test_product_evaluator.py` | 3 | Structured facts to the evaluator without searching Amazon. |
+| `tests/test_response_policy.py` | 3 | Prompt separation and sentence-safe normalization. |
 
-The code reads these environment-variable names from `.env`:
+## Features completed this session
 
-- `TELEGRAM_BOT_TOKEN`
-- `AUTHORIZED_TELEGRAM_USER_ID`
-- `LLM_BASE_URL`
-- `LLM_MODEL`
+1. **Conversational continuity (ADR-043).** The agent persists the questions it asks. A clarifying question creates an `awaiting_request_clarification` workflow, and the next message answers it — including when the model returns no confident classification. Unambiguous replies (`yes`, `no`, `cancel`, `3`, `option 2`) are executed deterministically with no model call. An unclassified reply re-asks the pending question instead of answering something unrelated.
+2. **Deterministic ranking and hard filtering (ADR-044).** `cheap` requests order by price per item, falling back to total price with the limitation stated. Extracted constraints (`max_price`, `min_rating`, `prime`) are now actually applied, and removals are reported. Previously the user's stated budget was silently ignored.
+3. **Product-fact conversation (ADR-045).** Questions about the options on screen now travel with those options serialized as structured context. Previously the model was asked about products it could not see.
+4. **In-place refinement.** "Only the Prime ones" now narrows the current results and re-presents them, instead of replying "start a new search after cancelling this workflow". A refinement matching nothing is reported and not persisted, so the user is never stranded.
+5. **Readable output.** Concise fact-preserving display titles, blank-line spacing, unit prices, and next-step hints offering only replies that apply to the specific candidates.
+6. **Workflow expiry (ADR-046).** An abandoned workflow no longer blocks every later purchase request forever.
 
-Do not store secrets in source control or paste their values into documentation, terminal logs, or chat. `.env.example` lists all four required names with empty values.
+## Bugs fixed this session
 
-## 8. Exact Current Behavior
+- `candidate_resolver.explicit_position()` returned `0` for "last" when no candidates were stored, which would have indexed into an empty list from the new fast path.
+- The deterministic fast path initially read "cancel the second one and show me batteries" as selecting option 2. It now requires the message to contain nothing but position words.
+- A refinement previously dead-ended the conversation.
+- A stale workflow permanently blocked new purchases.
+- Ranking basis was reported as "Amazon's own result order" after a refinement that preserved a previous sort; refinements now say "in their previous order" and "Narrowed to" rather than claiming a new search.
 
-For an authorized Telegram text message:
+## Remaining technical debt
 
-1. `main.py` prints existing sender/message metadata to the terminal.
-2. It sends one `Thinking…` placeholder message.
-3. `agent.py` first preserves these explicit, case-insensitive aliases:
-   - `remember: <key> = <value>` stores trimmed strings and returns `Remembered '<key>'.`
-   - `recall: <key>` returns `Memory for '<key>': <value>` or `Nothing is stored for '<key>'.`
-   - `forget: <key>` safely removes the key and returns `Forgot '<key>'.`
-   - `search: <query>` calls `amazon.search_products()`, creates a `RequestContext`, then passes both to `product_evaluator.evaluate_products()`.
-4. For all other messages, `intent_classifier.py` returns validated JSON intent metadata before `agent.py` routes the request.
-   - Natural memory intents use the existing memory functions when the classifier supplies the required key/value entities.
-   - Natural Amazon search intents use the existing read-only search and evaluation flow when the classifier supplies a query.
-   - Classified reorder and buy intents return safe messages; they do not access history or execute purchasing steps.
-   - `general_chat`, `unknown`, malformed JSON, and classifier failures use the existing ordinary local-model path.
-5. Malformed explicit memory commands return `Memory usage: remember: <key> = <value>; recall: <key>; forget: <key>.` An empty explicit search query returns `Search usage: search: <query>.`
-6. Search failures return a friendly error without evaluating results. Evaluation failures return a friendly local-model error. Search results and recommendations are not stored as preferences or purchase history.
-7. `main.py` replaces `Thinking…` with the final response.
-8. If the completed response is longer than Telegram's 4,096-character text limit, `main.py` places the first section in the placeholder and sends the remaining complete sections as additional messages.
+- `llm_client.py` keeps two near-parallel request paths. Unifying them changes the live-verified LM Studio interaction, so it is left until live re-verification is possible.
+- `AmazonWorkflowGateway` has no implementers and its `place_confirmed_order(confirmation_version)` shape predates ADR-026's idempotency and audit requirements. Redesign it alongside the cart milestone.
+- `workflow_store.transition()` records state changes consistently but does not reject illegal transitions.
+- `product_evaluator.evaluate_products()` output reaches Telegram as unvalidated model prose on the `search:` alias path.
+- `Candidate.brand` is never populated, so brand matching relies on title text.
+- `agent.py` is 569 lines. It is coherent, but the purchase-workflow half is the natural next extraction if it keeps growing.
+- Stop-word, affirmation, and pack-size vocabularies are English and hand-maintained.
 
-Streaming is not part of the current implementation. Temporary streaming diagnostics have been removed.
+## Remaining blockers
 
-## 9. Verification Completed
+These need something I cannot supply:
 
-- LM Studio loaded `Qwen3.5-4B-MLX-4bit` and served the configured local OpenAI-compatible API.
-- The model identifier `qwen3.5-4b-mlx` was verified.
-- Telegram-to-local-model-to-Telegram inference was verified end to end.
-- The complete-response Telegram behavior was tested successfully through Telegram on 2026-07-24.
-- A direct, non-mocked call to `generate_response()` passed against LM Studio on 2026-07-24 and returned 17 non-empty visible characters. The request used the configured local endpoint and did not expose response content or reasoning fields.
-- The current source was inspected on 2026-07-24.
-- `tests/test_complete_response_flow.py` was added and verified with five mocked tests on 2026-07-24. It covers visible completed content, empty/whitespace model output, the friendly agent error, and long completed-response sectioning.
-- `tests/test_memory.py` was added and verified with six temporary-database tests on 2026-07-24. It covers storing and recalling values, updates, missing-key recall, forgetting existing and missing keys, and persistence across separate SQLite connections.
-- `tests/test_agent_memory_commands.py` was added and verified with seven temporary-database/mocked-LLM tests on 2026-07-24. It covers valid remember, recall, missing recall, and forget commands; malformed commands and empty keys; and the ordinary LLM fallback.
-- `tests/test_agent_memory_commands.py` now includes two mocked Amazon-search command tests. They cover routing structured results to the product evaluator and rejecting an empty query without calling Amazon or LM Studio.
-- `tests/test_product_evaluator.py` verifies with mocked LLM and Amazon-search boundaries that the evaluator receives structured products, does not invoke Amazon search, and builds a fact-bounded comparison prompt.
-- `tests/test_product_evaluator.py` now verifies `RequestContext` creation and reorder-style metadata detection without history access. The search-route test verifies that the context and structured products reach the evaluator; existing memory and ordinary-message tests remain unchanged.
-- `tests/test_intent_classifier.py` mocks LM Studio and covers every supported intent, malformed JSON fallback, and low-confidence actionable-intent handling.
-- Agent tests cover natural memory and search routing while preserving explicit-command alias coverage.
-- `.venv/bin/python -m pytest` passed: 35 passed in 0.44s on 2026-07-27. Tests do not perform live Amazon requests.
-- `.venv/bin/python -m py_compile src/main.py src/agent.py src/llm_client.py src/memory.py src/amazon.py src/product_evaluator.py src/request_context.py src/intent_classifier.py` passed on 2026-07-27.
-- `PYTHONPATH=src .venv/bin/python -c "import main, agent, llm_client, memory, amazon, product_evaluator, request_context, intent_classifier"` passed on 2026-07-27.
-- `git diff --check` passed on 2026-07-27.
-- The virtual environment and installed package versions listed above were inspected on 2026-07-24.
+1. **Manual Telegram verification.** Everything above is unit-verified with mocked boundaries. Nothing has been confirmed in a real conversation against real LM Studio and real Amazon results.
+2. **Delivery estimates.** Writing extraction selectors requires real Amazon result HTML to inspect; guessing selectors would produce silently wrong delivery claims.
+3. **Invisible search.** `AMAZON_BROWSER_HEADLESS` already exists. Making headless the default requires confirming the authenticated profile still works headlessly, which needs a live signed-in run.
+4. **Using stored memory in purchasing** ("buy my usual toothpaste") requires an explicit policy decision. ADR-021 separates purchase history from preferences and forbids unreviewed inference, so this needs a new ADR before implementation, not a code change.
+5. **Cart and checkout** remain gated behind ADR-026 and must not begin until the preview loop is manually verified.
 
-## 10. Known Limitations and Risks
+## Required next architectural checkpoint
 
-- The Mac, LM Studio, and loaded model must remain available for replies to work.
-- 8 GB unified memory limits model size and may create pressure once Chromium/Playwright is introduced.
-- The test baseline covers unit behavior only; it does not replace manual Telegram or LM Studio integration testing.
-- `requirements-dev.txt` pins pytest only; production dependency installation is not yet reproducible from a manifest.
-- Missing or malformed environment variables do not yet receive explicit startup validation.
-- Telegram/network/API failures around placeholder edits are not yet given dedicated retry handling.
-- Memory is available only through explicit commands; there is no automatic extraction, conversation history, embeddings, semantic search, or preference policy.
-- The explicit memory flows have not yet been manually verified through Telegram; no Telegram polling or LM Studio service was started during automated verification.
-- The Amazon search tool has unit coverage but has not been verified against live Amazon. Amazon may change result-page selectors, show CAPTCHAs, restrict automated browsing, or fail when Chromium or network access is unavailable.
-- Search results are limited to visible initial product fields, including Prime eligibility only when Amazon exposes it. They do not include review scraping or complete product data.
-- The evaluator is prompt-constrained to structured facts, but a local model can still produce an inaccurate recommendation; live review is required before relying on its output.
-- Natural-language routing depends on local-model structured JSON. Invalid, malformed, failed, or low-confidence actionable classifications safely fall back to ordinary chat or `unknown`; manual verification is still required.
-- Classified buy and reorder intents are recognized but deliberately non-executing. They do not access order history, login, cart, checkout, or purchasing.
-- Reorder-style metadata is a limited phrase match only. It is neither authorization nor evidence of a prior purchase, and no order-history lookup or reorder action exists.
-- TODO comments identify future Amazon order-history lookup, reorder workflow, successful-checkout purchase-history recording, preference-inference policy, and duplicate-order prevention integration points; none is implemented.
-- The tool has no login, cart, checkout, purchase, purchase-history, or preference-writing capability.
-- Any future purchasing workflow is financially consequential and requires explicit safety, confirmation, audit, and authorization design before implementation.
+**Manually verify the complete preview conversation in Telegram, then decide the memory-in-purchasing policy.**
 
-## 11. Current Roadmap
+Suggested manual script, in one Telegram conversation:
 
-1. Manually verify explicit aliases and natural-language memory, search, reorder, buy, and general-chat classifications through Telegram.
-2. Add configuration validation and reproducible startup hardening.
-3. Create a production dependency manifest after the startup configuration contract is defined.
-4. Deliberately select a checkpoint to extend preference storage.
-5. Improve read-only search and recommendation behavior only after live verification of the initial tool and evaluator output.
-6. Add confirmation, audit, price-limit, and duplicate-prevention safeguards.
-7. Consider browser automation for cart and purchase stages only after the earlier safety stages are verified.
+1. `find me a good deal` → expect the clarifying question.
+2. `AA batteries` → expect ranked candidates with unit prices and spacing.
+3. `which has the most reviews?` → expect an answer using only the shown options.
+4. `only the Prime ones` → expect "Narrowed to N", with removals reported.
+5. `3` → expect an instant selection with no model latency.
+6. `cancel` → expect the workflow to close.
 
-### Accepted future data-design direction (not implemented)
+Capture the actual replies and latencies. Any wrong answer at step 3 indicates the candidate context is not reaching the model; any slow reply at step 5 indicates the deterministic path was bypassed.
 
-- Purchase history will use a dedicated data store or a clearly separated data model from user preferences.
-- Record a completed purchase only after its order is successfully completed. Do not treat search results, recommendations, viewed products, cart-only items, abandoned checkouts, failed orders, or cancelled orders as completed purchase history.
-- Completed purchase records should eventually include the product identifier, product name, quantity, price paid, order date/time, order identifier when available, vendor/marketplace, and final order status.
-- A single purchase must not automatically become a user preference. Preferences may come from explicit user statements, future reviewable rules, or repeated evidence only if a later policy explicitly allows it.
-- Users must eventually be able to inspect, correct, and delete preferences and purchase-history records independently.
-- Purchase history must support future duplicate prevention, reorder logic, auditability, and order-status workflows.
+## Commands and verification levels
 
-Do not begin Amazon automation until the current milestone is documented and the next checkpoint is selected deliberately.
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python -m py_compile src/*.py scripts/*.py tests/*.py
+PYTHONPATH=src .venv/bin/python -c "import main, agent, llm_client, memory, amazon, product_evaluator, request_context, intent_classifier, candidate_resolver, workflow_models, workflow_store, timing, ranking, product_display, workflow_reply"
+git diff --check
+```
 
-## 12. Immediate Next Checkpoint
+Live services are deliberate and manual only; see `README.md`. Do not start Telegram polling for automated verification, and avoid duplicate bot instances. Automated tests do not prove LM Studio, Amazon, or Telegram integration.
 
-Manually verify explicit aliases and natural-language examples through Telegram: `remember: <key> = <value>`, `recall: <key>`, `forget: <key>`, `search: AA batteries`, “Remember that I prefer Sensodyne,” “Find AA batteries under twenty dollars,” “Order AA batteries,” and “What’s the capital of France?” Confirm natural memory and search use their existing safe routes, buy/reorder remain non-executing, and ordinary chat still works.
+## Worktree and ADR status
 
-Do not start later roadmap work during this checkpoint. After verification, update this document with the observed results before selecting the next milestone.
-
-## 13. Development Workflow and Learning Preferences
-
-- Inspect current files before changing them; do not assume older documentation is accurate.
-- Keep the Big 3 boundaries intact: Telegram in `main.py`, coordination in `agent.py`, and model-server communication in `llm_client.py`.
-- Prefer small, verified changes. Use the project's virtual-environment Python for syntax and import checks.
-- Do not start the Telegram bot during automated validation unless explicitly requested; manual Telegram testing remains a separate step.
-- Use beginner-friendly comments for module boundaries and non-obvious logic, but do not comment every obvious line.
-- After a significant concept, use a Teach-It-Back checkpoint:
-  1. Explain the concept.
-  2. Ask the user to restate it in their own words.
-  3. Correct only meaningful misunderstandings.
-  4. Continue.
-- A separate personal learning library exists at `~/engineering-notes/`. It stores mental models and explanations, and is not production project documentation.
+`git status` is intentionally dirty and nothing has been committed. This session added `src/ranking.py`, `src/product_display.py`, `src/workflow_reply.py`, `tests/test_ranking.py`, `tests/test_product_display.py`, `tests/test_workflow_reply.py`, and `tests/test_conversation_continuity.py`, and appended **ADR-043 through ADR-046**. ADR-046 refines ADR-030 and ADR-043 extends ADR-029/ADR-033; the original entries are retained per the append-only rule.

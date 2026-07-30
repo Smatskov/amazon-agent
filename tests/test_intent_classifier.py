@@ -7,69 +7,70 @@ import pytest
 import intent_classifier
 
 
-@pytest.mark.parametrize(
-    "intent, message",
-    [
-        ("general_chat", "What's the capital of France?"),
-        ("memory_remember", "Remember that I prefer Sensodyne."),
-        ("memory_recall", "What toothpaste do I usually buy?"),
-        ("memory_forget", "Forget my preferred toothpaste."),
-        ("amazon_search", "Find AA batteries under twenty dollars."),
-        ("amazon_reorder", "Order the toothpaste from last time."),
-        ("amazon_buy", "Order AA batteries."),
-        ("unknown", "Do the thing with the thing."),
-    ],
-)
-def test_classifier_accepts_each_supported_intent(monkeypatch, intent, message):
-    response = json.dumps(
-        {
-            "intent": intent,
-            "confidence": 0.9,
-            "entities": {"key": "preferred toothpaste"},
-            "reasoning": "test only",
-            "requires_confirmation": intent in {"amazon_buy", "amazon_reorder"},
-            "extracted_product_name": "AA batteries",
-            "extracted_search_query": "AA batteries",
-        }
-    )
-    generate_response = AsyncMock(return_value=response)
-    monkeypatch.setattr(intent_classifier, "generate_response", generate_response)
+def test_router_then_memory_specialist_uses_tiny_json_prompts(monkeypatch):
+    generate = AsyncMock(side_effect=[
+        json.dumps({"route": "memory", "confidence": 0.99}),
+        json.dumps({"action": "recall", "key": "favorite toothpaste", "value": None, "confidence": 0.99}),
+    ])
+    monkeypatch.setattr(intent_classifier, "generate_response", generate)
 
-    result = asyncio.run(intent_classifier.classify_intent(message))
+    result = asyncio.run(intent_classifier.interpret_message("What was my favorite toothpaste?"))
 
-    assert result.intent == intent
-    assert result.confidence == 0.9
-    assert result.entities == {"key": "preferred toothpaste"}
-    generate_response.assert_awaited_once()
+    assert result.action == "recall"
+    assert result.key == "favorite toothpaste"
+    assert generate.await_count == 2
+    router_prompt = generate.await_args_list[0].args[0]
+    specialist_prompt = generate.await_args_list[1].args[0]
+    assert "action, key, value" not in router_prompt
+    assert "product_query" not in router_prompt
+    assert "memory request" in specialist_prompt
+    assert generate.await_args_list[0].kwargs["max_tokens"] == 256
+    assert generate.await_args_list[1].kwargs["max_tokens"] == 256
 
 
-def test_classifier_falls_back_to_general_chat_for_malformed_json(monkeypatch):
-    monkeypatch.setattr(
-        intent_classifier, "generate_response", AsyncMock(return_value="not JSON")
-    )
+@pytest.mark.parametrize("raw", [
+    "not json",
+    json.dumps({"route": "memory"}),
+    json.dumps({"route": "memory", "confidence": 2}),
+    json.dumps({"route": "not_a_route", "confidence": 0.9}),
+])
+def test_invalid_router_output_is_a_safe_no_match(monkeypatch, raw):
+    monkeypatch.setattr(intent_classifier, "generate_response", AsyncMock(return_value=raw))
+    result = asyncio.run(intent_classifier.interpret_message("Anything"))
+    assert result.classification_valid is False
+    assert result.action == "no_match"
 
-    result = asyncio.run(intent_classifier.classify_intent("Find AA batteries."))
 
-    assert result == intent_classifier.IntentResult("general_chat", 0.0, {})
+@pytest.mark.parametrize("raw", [
+    json.dumps({"action": "recall", "key": None, "value": None, "confidence": 0.9}),
+    json.dumps({"action": "remember", "key": "favorite drink", "value": None, "confidence": 0.9}),
+    json.dumps({"action": "recall", "key": "favorite drink", "value": "tea", "confidence": 0.9}),
+    json.dumps({"action": "recall", "key": "favorite drink", "value": None, "confidence": 0.2}),
+])
+def test_memory_specialist_rejects_or_downgrades_unconfident_actions(monkeypatch, raw):
+    monkeypatch.setattr(intent_classifier, "generate_response", AsyncMock(side_effect=[
+        json.dumps({"route": "memory", "confidence": 0.9}), raw
+    ]))
+    result = asyncio.run(intent_classifier.interpret_message("Memory request"))
+    assert result.action == "no_match"
 
 
-def test_classifier_downgrades_low_confidence_action_to_unknown(monkeypatch):
-    response = json.dumps(
-        {
-            "intent": "amazon_search",
-            "confidence": 0.2,
-            "entities": {"search_query": "AA batteries"},
-            "reasoning": None,
-            "requires_confirmation": False,
-            "extracted_product_name": None,
-            "extracted_search_query": "AA batteries",
-        }
-    )
-    monkeypatch.setattr(
-        intent_classifier, "generate_response", AsyncMock(return_value=response)
-    )
+def test_purchase_specialist_validates_only_explicit_scalar_constraints(monkeypatch):
+    generate = AsyncMock(side_effect=[
+        json.dumps({"route": "purchase", "confidence": 0.97}),
+        json.dumps({"action": "purchase_start", "product_query": "toothpaste", "constraints": {"max_price": 20, "prime": True}, "quantity": 2, "confidence": 0.97}),
+    ])
+    monkeypatch.setattr(intent_classifier, "generate_response", generate)
+    result = asyncio.run(intent_classifier.interpret_message("Buy two toothpaste packs under $20 with Prime"))
+    assert result.action == "purchase_start"
+    assert result.product_query == "toothpaste"
+    assert result.quantity == 2
+    assert result.constraints == {"max_price": 20, "prime": True}
 
-    result = asyncio.run(intent_classifier.classify_intent("Find AA batteries."))
 
-    assert result.intent == "unknown"
-    assert result.confidence == 0.2
+def test_general_chat_stops_after_router(monkeypatch):
+    generate = AsyncMock(return_value=json.dumps({"route": "general_chat", "confidence": 0.99}))
+    monkeypatch.setattr(intent_classifier, "generate_response", generate)
+    result = asyncio.run(intent_classifier.interpret_message("What is France?"))
+    assert result.route == "general_chat"
+    assert generate.await_count == 1

@@ -6,7 +6,10 @@ import re
 
 from amazon import Product
 from llm_client import generate_response
+import ranking
 from request_context import RequestContext
+from response_policy import PRODUCT_EVALUATION_MAX_TOKENS, PRODUCT_EVALUATION_SYSTEM_PROMPT
+from workflow_models import Candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +18,30 @@ class EvaluationResult:
 
     recommendation: str
     appears_to_be_reorder: bool
+
+
+def candidate_context(candidates: list[Candidate]) -> str:
+    """Serialize the options currently shown so the model can answer about them.
+
+    A question like "what's the difference between the first two?" is answerable only
+    if the facts travel with it. Without this the model was asked about products it
+    could not see, which is exactly how invented product facts get produced.
+    """
+    return json.dumps(
+        [
+            {
+                "option": index,
+                "title": candidate.title,
+                "price": candidate.price_text,
+                "unit_price": None if unit is None else round(unit, 2),
+                "rating": candidate.rating,
+                "review_count": candidate.review_count,
+                "prime_eligible": candidate.prime_eligible,
+            }
+            for index, candidate in enumerate(candidates, start=1)
+            for unit in [ranking.unit_price(candidate)]
+        ]
+    )
 
 
 def _appears_to_request_reorder(context: RequestContext) -> bool:
@@ -57,6 +84,8 @@ async def evaluate_products(
     """Return the local model's recommendation for structured product facts only."""
     appears_to_be_reorder = _appears_to_request_reorder(context)
     recommendation = await generate_response(
-        _evaluation_prompt(context, products, appears_to_be_reorder)
+        _evaluation_prompt(context, products, appears_to_be_reorder),
+        max_tokens=PRODUCT_EVALUATION_MAX_TOKENS,
+        system_prompt=PRODUCT_EVALUATION_SYSTEM_PROMPT,
     )
     return EvaluationResult(recommendation, appears_to_be_reorder)

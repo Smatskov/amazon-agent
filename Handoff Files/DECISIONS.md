@@ -758,3 +758,605 @@ Consequences:
 - `agent.py` routes validated memory and search intents to existing interfaces; it returns safe non-executing responses for buy and reorder intents.
 - Explicit `remember:`, `recall:`, `forget:`, and `search:` commands remain supported aliases.
 - Future classifier expansion must preserve validation and agent-owned execution boundaries.
+
+---
+
+## ADR-026 — Development Purchase Confirmation Gate
+
+Status: Accepted for roadmap; not yet implemented
+
+Decision:
+
+During early development, validation, and the initial production milestone, every purchase must pass through a mandatory explicit user-confirmation gate.
+
+The confirmation gate is a hard architectural boundary immediately before the irreversible `Place Order` action. No code path may bypass it. After an order is prepared, the agent must send a Telegram summary of the selected product, quantity, price, shipping, and estimated total, then wait for explicit user confirmation before placing the order.
+
+Context:
+
+Purchasing is financially consequential. Early workflows require a visible, reviewable pause between preparation and the irreversible external action while the agent, browser automation, product data, and safety controls are being validated.
+
+Reasoning:
+
+- Prevents an accidental or incorrect prepared order from being completed immediately.
+- Makes the user-visible cost and delivery details reviewable at the final decision point.
+- Creates one auditable control point that future purchase implementations must share.
+- Keeps safety policy in deterministic application architecture rather than model behavior alone.
+
+Tradeoffs:
+
+- Adds friction to every early purchase.
+- Requires reliable prepared-order summaries and explicit confirmation-state handling.
+- Delays fully automated repeat-order behavior until configurable approval policy is designed and verified.
+
+Consequences:
+
+- Future purchase code must prepare an order, present the required Telegram summary, and receive explicit confirmation before the final action.
+- No browser, model, workflow, or retry path may directly place an order without passing through the gate.
+- The long-term design may allow configurable approval rules, but the initial production milestone always requires explicit user confirmation.
+
+---
+
+## ADR-027 — Structured Natural-Language Memory Intent Boundary
+
+Status: Accepted and implemented
+
+Decision:
+
+Natural-language memory requests must cross a validated structured-intent boundary before `agent.py` reads or changes memory. The classifier returns an intent record with a memory action (`remember`, `recall`, `forget`, or `general_chat`) and nullable key/value fields. `agent.py` performs the memory operation only after validating the required fields: remember requires a non-empty key and value; recall and forget require a non-empty key.
+
+The colon-form commands `remember: <key> = <value>`, `recall: <key>`, and `forget: <key>` remain deterministic developer/debug aliases. Only malformed attempts at those exact colon-form commands receive command usage guidance. Other ordinary or command-like natural language is sent to classification.
+
+Classification is time-bounded in the orchestration layer. A timeout, model failure, malformed JSON, or invalid/ambiguous memory result returns a friendly safe response and must not read, write, or delete memory.
+
+Context:
+
+Manual Telegram verification proved the deterministic explicit commands, but ordinary memory requests were incorrectly intercepted as malformed commands or waited for several minutes on local-model classification. The agent needs natural-language support without granting unvalidated model output authority over persistent user data.
+
+Reasoning:
+
+- Separates probabilistic extraction from deterministic persistence actions.
+- Makes the data required for each memory action explicit, testable, and rejectable.
+- Preserves reliable short developer/debug commands while allowing ordinary user language to reach classification.
+- Prevents an unavailable or slow local model from leaving the Telegram placeholder indefinitely.
+- Fails closed for memory mutations rather than guessing a key or value.
+
+Tradeoffs:
+
+- Natural-language memory requests add one local-model classification call and may receive a friendly retry response when extraction is uncertain.
+- The 10-second deadline can reject a valid request when the local machine is overloaded.
+- A stricter schema requires model prompts and tests to evolve together when the intent contract changes.
+
+Consequences:
+
+- `intent_classifier.py` remains the only model-facing classification component; it never accesses memory or executes actions.
+- `agent.py` retains orchestration and is the only component that invokes `memory.py` for classified requests.
+- Invalid classifications cannot mutate memory, and valid `general_chat` classifications retain the ordinary LLM response path.
+- Future changes to natural-language memory semantics must preserve validation, deterministic explicit aliases, and bounded failure behavior.
+
+---
+
+## ADR-028 — Use Deterministic Extraction Before Memory-Classification Fallback
+
+Status: Accepted and implemented
+
+Decision:
+
+Handle only clear, predefined natural-language memory phrases with a pure deterministic extractor before invoking the structured LLM classifier. The extractor returns the existing validated action/key/value representation and has no storage access. `agent.py` remains the only memory executor.
+
+When deterministic extraction has no confident match, use the existing classifier architecture as fallback. For memory-style fallback requests, use a compact JSON contract containing only `action`, `key`, and `value`; broad classification remains unchanged for general chat and Amazon intents.
+
+Context:
+
+The 10-second classification deadline expired for a clear natural-language remember request before LM Studio returned a response. The diagnostic evidence contained the outbound prompt but no response or validation result. The previous all-intent prompt requested unrelated Amazon, product, confidence, reasoning, and confirmation fields for a simple memory operation, adding avoidable local-model work.
+
+Reasoning:
+
+- Eliminates local-model latency for clear, repeatable memory phrasing.
+- Keeps deterministic extraction conservative: ambiguous language does not guess a key, value, or action.
+- Preserves the structured model boundary for language outside the narrow deterministic grammar.
+- Reduces the fallback prompt and output schema to the facts needed for safe memory routing.
+- Retains agent-owned storage execution and the existing timeout fail-safe.
+
+Tradeoffs:
+
+- The deterministic grammar intentionally supports only a small set of phrases and needs explicit expansion for new wording.
+- Ambiguous requests can still time out or fail validation rather than taking a guessed action.
+- Two extraction paths require regression tests to keep their shared action/key/value contract aligned.
+
+Consequences:
+
+- Clear supported memory requests no longer need LM Studio before reaching `agent.py` memory execution.
+- The parser performs no reads, writes, or deletes; it returns metadata only.
+- Ambiguous memory requests retain the 10-second deadline and concise terminal-only diagnostics for timeout, model error, invalid JSON, and validation failure.
+- Verbose prompt, user-message, and raw-response debug logging is removed from normal development behavior.
+
+---
+
+## ADR-029 — Use a State-Aware Top-Level Conversational Router
+
+Status: Accepted and implemented
+
+`agent.py` routes exact memory commands, deterministic natural memory, state-aware purchase dialogue, structured classifier fallback, and general chat in that order. A parser no-match is not an error and no subsystem may emit another subsystem's usage response. This fixes purchase language entering memory handling while preserving explicit debug commands.
+
+---
+
+## ADR-030 — Persist One Active Preview Workflow Per Telegram User
+
+Status: Accepted and implemented
+
+SQLite stores one active purchasing workflow per authenticated Telegram user, including versioned state, safe request context, mocked candidates, selection, quantity, and timestamps. The workflow survives process restart. A new purchase request does not silently overwrite an active workflow; the user must cancel it first.
+
+---
+
+## ADR-031 — Resolve Candidate References Against Persisted Typed Candidates
+
+Status: Accepted and implemented
+
+Candidate reference resolution is a dedicated deterministic boundary. It may select only a unique stored candidate by ordinal, title/brand fragment, or supported comparison; zero or multiple matches produce focused clarification and never silently guess.
+
+---
+
+## ADR-032 — Define a Mocked Amazon Workflow Interface Before Live Automation
+
+Status: Accepted and implemented
+
+`amazon.py` defines a typed future gateway for order lookup, search, details, cart, checkout inspection, and confirmed placement. Milestone 1 uses mocked typed candidates only and does not invoke Playwright, cart, checkout, or placement through that interface.
+
+---
+
+## ADR-033 — Hierarchical Semantic Extraction Is the Conversational Front Door
+
+Status: Accepted and implemented
+
+Decision:
+
+Replace deterministic natural-language memory and purchase parsers, plus the broad all-intent schema, with hierarchical LLM semantic extraction. A compact router first chooses only `memory`, `purchase`, `workflow`, `general_chat`, or `unknown`. Only a confident actionable route invokes its small domain specialist. Each specialist returns JSON that is strictly validated before `agent.py` performs deterministic work.
+
+Context:
+
+The earlier phrase-based front door failed ordinary grammatical variations such as “What was my favorite toothpaste?” and made future capability growth depend on continually adding patterns. The oversized classifier schema also asked a small local model to solve unrelated extraction problems in every request.
+
+Consequences:
+
+- `intent_classifier.py` has no memory, browser, workflow-store, Telegram, or purchase execution access.
+- `agent.py` remains the sole executor for memory and workflow state transitions.
+- Invalid JSON, malformed fields, low confidence, model failures, and timeouts become no-match; they never produce usage guidance or execute an action. The agent then continues to general chat.
+- Explicit colon-form developer aliases remain deterministic.
+- Router output is capped at 32 tokens; specialists are capped at 80–100 tokens and use JSON mode.
+- The old natural-language parser and its phrase list were removed. Candidate reference resolution remains deterministic only after a workflow already has stored candidates.
+- Live LM Studio and Telegram verification remains pending because the configured local endpoint was unavailable during this change.
+
+---
+
+## ADR-034 — Semantic Interpretation Uses Diagnostic Soft and Safety Hard Timeouts
+
+Status: Accepted and implemented
+
+Decision:
+
+Semantic interpretation has a 20-second soft timeout and a 120-second hard timeout. The soft timeout only emits a timing diagnostic and continues to await the same task. The hard timeout cancels that task, awaits its cancellation, and returns the existing graceful local-model failure response.
+
+Context:
+
+The former short orchestration deadline cancelled semantic interpretation before a local LM Studio response could complete. This made a diagnostic threshold behave as a user-visible failure.
+
+Consequences:
+
+- Telegram retains its existing “Thinking…” placeholder while the semantic task continues after 20 seconds.
+- Request-scoped monotonic timings cover preparation, HTTP request setup, first byte, first generated token, model completion, parsing, validation, deterministic action execution, and total elapsed time.
+- The timing log compares the LM Studio window with all remaining time, so it explicitly identifies when the majority of measured latency is outside LM Studio.
+- The hard deadline prevents indefinite waits while preserving the existing JSON validation, deterministic action execution, memory-mutation, and preview-only purchasing safeguards.
+
+---
+
+## ADR-035 — LM Studio Structured Output Uses Strict Plain JSON With a Guarded Reasoning Fallback
+
+Status: Accepted and implemented
+
+Decision:
+
+Semantic prompts request one compact JSON object directly at temperature zero with a bounded 256-token output budget. The prior permissive native JSON-schema request is not used for semantic extraction. Visible assistant content remains preferred. Only when it is empty may `llm_client.py` use LM Studio `reasoning_content`, and only if the complete trimmed field parses as exactly one JSON object. Typed route and specialist validation remains unchanged in `intent_classifier.py`.
+
+Context:
+
+The configured Qwen/LM Studio response shape placed generated output in `reasoning_content` while `message.content` was empty despite `finish_reason=stop`. The permissive schema accepted `{}`, which provided no semantic fields.
+
+Consequences:
+
+- Reasoning prose, markdown, multiple JSON objects, arrays, prefixes, suffixes, and incomplete output cannot trigger an action.
+- A clean JSON object from the compatibility field receives the same downstream validation as visible JSON.
+- Memory and workflow mutation remain agent-owned and fail closed on malformed output.
+
+---
+
+## ADR-036 — Default the Installed Qwen Template to a Closed Think Block
+
+Status: Accepted and implemented
+
+Decision:
+
+For the installed `lmstudio-community/Qwen3.5-4B-MLX-4bit` model, default the existing `enable_thinking` template branch to false when the variable is absent, then unload and reload the same model. Preserve a backup of the original template outside the repository.
+
+Context:
+
+The model’s bundled template began generation with an open `<think>` block by default. LM Studio 0.4.20+1 did not pass the template variable through the OpenAI-compatible request and reported that its reasoning control could not be converted to custom model fields. Consequently, normal final output was classified as reasoning and `message.content` was empty for both raw HTTP and SDK requests.
+
+Consequences:
+
+- The same Qwen model and LM Studio runtime now emit final assistant output into `choices[0].message.content`.
+- Raw HTTP and OpenAI SDK responses agree; no client mapping workaround is needed.
+- The application keeps its strict JSON validation and guarded reasoning fallback as defense in depth.
+
+---
+
+## ADR-037 — Separate Conversational, Semantic, and Product-Fact Prompt Contracts
+
+Status: Accepted and implemented
+
+Decision:
+
+Use a dedicated user-facing purchasing-agent system prompt only for ordinary Telegram conversation. Keep semantic router and specialist calls on compact JSON-only user prompts with no conversational system prompt. Use a distinct fact-bounded system prompt for product evaluation. Bound ordinary conversation to a 180-token request budget and sentence-safe Telegram-sized normalization.
+
+When semantic interpretation does not yield a validated purchase action but a message still has generic shopping signals, return one deterministic clarification instead of allowing an unconstrained general-chat model response.
+
+Context:
+
+Telegram testing showed a shopping request receive a long generic answer containing unsupported retailer-style recommendations. The old fallback called the language model with only the raw user message, even though the model is the language layer of a purchasing agent rather than an independent shopping source.
+
+Consequences:
+
+- Validated shopping requests remain agent-owned preview workflows and cannot use general chat to invent product facts.
+- Semantic JSON extraction retains its exact schema, bounded JSON contract, and all existing mutation safeguards.
+- Product comparison remains limited to supplied structured records; the new prompt does not authorize search, cart, checkout, or ordering.
+- A small commerce-signal fallback is a fail-closed guard, not a product parser or a replacement for semantic routing. It creates no workflow and executes no tool.
+
+---
+
+## ADR-038 — Require Read-Only Amazon Results Before Creating Purchase Candidates
+
+Status: Accepted and implemented
+
+Decision:
+
+Remove fabricated candidate generation from natural-language purchase start. The agent now invokes the existing isolated, unsigned, read-only Amazon search boundary and creates a selectable workflow only from returned product records. A candidate preserves only result fields supplied by that boundary. Amazon interstitials, selector timeouts, empty results, and search failures return a concise no-workflow response.
+
+Context:
+
+The preview workflow used fixed mock products, prices, delivery labels, and ratings. This produced unrelated results — including Sensodyne-labelled AA batteries — and made an ordinary shopping reply look useful despite having no Amazon evidence.
+
+Consequences:
+
+- Product titles, prices, ratings, review counts, Prime indicators, and URLs shown in a workflow must originate in a read-only Amazon result.
+- No fabricated candidate may be selected, persisted, or used for price comparisons.
+- Legacy persisted candidates that lack a source URL are invalidated before new routing.
+- Amazon can return an anti-automation or other interstitial; that condition is surfaced safely and does not broaden access, attempt a bypass, or permit a purchase.
+
+---
+
+## ADR-039 — Use a User-Managed Persistent Profile for Read-Only Amazon Search
+
+Status: Accepted and implemented
+
+Decision:
+
+Use a visible persistent Playwright Chromium profile, stored outside the repository, for manual Amazon sign-in and subsequent read-only product searches. The profile is configurable only through `AMAZON_BROWSER_PROFILE_DIR`; a repository-local profile path is rejected. Visible mode is the default. Headless mode is explicit and reserved for noninteractive diagnostics.
+
+Context:
+
+Amazon returned an interstitial to an unsigned transient headless browser. A user-managed session is required to permit legitimate sign-in or challenge completion without trying to evade Amazon protections.
+
+Consequences:
+
+- `amazon.py` remains the sole owner of browser lifecycle, session reuse, selectors, and public-result extraction.
+- The application never logs, parses, copies, or persists browser-profile contents, credentials, cookies, cart data, or account details.
+- Manual sign-in is performed through a dedicated visible script; the application still performs no cart, checkout, or order action.
+- Search and browser-close waits are bounded. A profile lock, interstitial, timeout, or browser error fails safely without creating a workflow or substituting stale/mock products.
+
+---
+
+## ADR-040 — Every Workflow State Change Goes Through `workflow_store.transition()`
+
+Status: Accepted and implemented
+
+Decision:
+
+`agent.py` may not assign `PurchaseWorkflow.state` directly. Every state change calls
+`workflow_store.transition(workflow, state, pending_question=...)`, which is the only place that
+increments `state_version`, sets the pending question, and records terminal completion status.
+
+Context:
+
+Only cancellation used `transition()`. Purchase start, refinement, and candidate selection assigned
+`workflow.state` directly and set `pending_question` by hand, so `state_version` stayed at 1 for the
+entire life of a workflow. ADR-030 describes versioned state and ADR-026 requires a confirmation that
+is invalidated when the prepared order changes; both depend on a version that actually advances.
+
+Reasoning:
+
+- A version that never changes cannot detect a stale confirmation, which is the core control in ADR-026.
+- One transition function is a single auditable place to add future guards on illegal transitions.
+- Setting `pending_question` beside the state change keeps the persisted question consistent with the state.
+
+Tradeoffs:
+
+- Callers must express a state change as a transition rather than an assignment.
+- `transition()` still does not reject illegal transitions; it only records them consistently.
+
+Consequences:
+
+- `state_version` is now a reliable monotonic counter per workflow and is covered by a regression test.
+- Future cart, checkout, and confirmation work inherits a single place to enforce legal transitions and
+  version invalidation; it must not reintroduce direct state assignment.
+
+---
+
+## ADR-041 — Persisted Workflow Records Are Deserialized Field-Tolerantly
+
+Status: Accepted and implemented
+
+Decision:
+
+`PurchaseWorkflow.from_record()` and `Candidate` reconstruction ignore keys a stored payload contains
+that the current model does not define, instead of raising. Required fields are still required.
+
+Context:
+
+Deserialization mapped every key by hand and called `Candidate(**candidate)`. Removing or renaming any
+persisted field would make existing rows raise `TypeError`/`KeyError` inside
+`workflow_store.get_active_workflow()`, which is called on the first line of ordinary message handling.
+A model change would therefore have broken every incoming Telegram message for a user with a saved
+workflow, in a code path with no error handling around it.
+
+Reasoning:
+
+- Persisted workflows outlive the code that wrote them, so the schema will change while rows exist.
+- Failing to read one stored workflow should never be able to break unrelated conversation handling.
+- Tolerant reads remove the hand-written field mapping, so adding a field no longer requires editing
+  two places that can silently drift apart.
+
+Tradeoffs:
+
+- A genuinely mistyped field name is dropped silently instead of raising during development.
+- Field removal is safe, but adding a *required* field to an existing model still needs a default.
+
+Consequences:
+
+- Workflow model fields can be added or retired without a migration script or a stale-row crash.
+- Legacy-candidate invalidation (ADR-038) remains the mechanism for rejecting semantically stale data;
+  tolerant deserialization is about shape, not trust.
+
+---
+
+## ADR-042 — Candidate References Resolve by Position, Comparison, or Described Words
+
+Status: Accepted and implemented; refines ADR-031
+
+Decision:
+
+Deterministic candidate resolution tries, in order: an explicit comparison (`cheapest`,
+`highest rated`), an explicit position (`option 5`, `#5`, a message that is only a number, an ordinal
+word through fifth, and `last`), a description scored by the significant words the user typed, and
+finally a bare number that appears anywhere in a longer message. Zero or ambiguous matches still
+produce clarification and never guess. Resolution against labels the live Amazon path does not populate
+was removed.
+
+Context:
+
+ADR-031 established the boundary but its implementation matched a description only when the *entire*
+message was a substring of a candidate title, and it handled no digits at all. In manual Telegram
+testing, `5` and `lets do the duracell` both failed against five real AA battery results. It also
+branched on `option_label` values such as `"fastest delivery"` and `"best value"` that no code path
+ever assigns, so those branches could only ever produce a misleading no-match.
+
+Reasoning:
+
+- An option number the agent itself displayed must always be selectable; that is the primary affordance.
+- Scoring the overlap between the user's significant words and a candidate's title/brand handles natural
+  references without a phrase list, and reports ambiguity when several candidates fit equally.
+- Numeric tokens are kept regardless of length because pack counts (`10 count`, `3 pack`) are how users
+  identify a variant.
+- An explicit position must outrank a description so `option 2` is never reread as a product word, while a
+  bare number inside a sentence is the weakest signal and is tried last.
+- A branch that can never match is worse than no branch: it produces a confident-sounding failure.
+
+Tradeoffs:
+
+- Word-overlap scoring can call a reference ambiguous where a human would infer one product; it asks
+  rather than guessing, which is the intended failure direction.
+- The stop-word list is English and hand-maintained.
+- `Candidate.option_label` and `delivery_label` are retained as unpopulated fields for Milestone 2
+  ranking labels and delivery extraction; nothing reads them today.
+
+Consequences:
+
+- Resolution stays deterministic, stays inside `candidate_resolver.py`, and still selects only among
+  already-persisted candidates.
+- Regression coverage in `tests/test_candidate_resolution.py` pins the previously failing references,
+  ambiguity behavior, out-of-range numbers, absent candidates, and comparisons with missing facts.
+- When ranking labels and delivery estimates are populated, label-aware matching may return, but it must
+  be added together with the data that makes it reachable.
+
+---
+
+## ADR-043 — A Question the Agent Asked Is Answered Deterministically and Statefully
+
+Status: Accepted and implemented
+
+Decision:
+
+When the agent asks a question, it persists the question as workflow state. When a reply
+arrives while a workflow is active, `workflow_reply.py` reads it deterministically first.
+Only unambiguous replies — confirmation, refusal, cancellation, and an explicitly stated
+option number — are acted on without the model. Anything else falls through to semantic
+interpretation unchanged. A clarifying question now creates a workflow in
+`AWAITING_REQUEST_CLARIFICATION`, and the next message answers it.
+
+Context:
+
+The shopping-signal fallback (ADR-037) asked "Are you looking for the cheapest matching
+option on Amazon?" and stored nothing, so the answer arrived with no context and was
+handled as an unrelated message. Separately, replies like `5` and `yea` had to survive a
+router classification and a specialist classification before reaching the workflow; either
+step returning `general_chat` or low confidence silently dropped the reply into ordinary
+chat. The most common message in the conversation was also the least reliable, and it paid
+full local-model latency.
+
+Reasoning:
+
+- A question with no persisted context cannot have a meaningful answer; the state machine
+  already had `AWAITING_REQUEST_CLARIFICATION` for exactly this.
+- "3" or "cancel" is not a language-understanding problem. Deterministic routing before
+  probabilistic reasoning is the existing rule for explicit input (ADR-029).
+- Removing a model round trip from the most frequent reply is a large, free latency win.
+- ADR-033 removed deterministic *routing* phrase lists; it explicitly kept deterministic
+  resolution once a workflow has stored candidates. This extends that, and does not revive
+  a general phrase router.
+
+Tradeoffs:
+
+- The affirmative/refusal vocabulary is English and hand-maintained.
+- The fast path is intentionally strict: every significant word must belong to one
+  vocabulary, so "no, do you have anything cheaper" defers to the model rather than
+  reading as a refusal. Strictness costs coverage and buys correctness.
+- `workflow_reply` and `candidate_resolver` need different strictness for the same words.
+  They share `candidate_resolver.explicit_position()` so they cannot disagree about what
+  "option 3" means, but `workflow_reply` additionally requires the message to say nothing
+  else. `candidate_resolver` may stay lenient because the model has already classified the
+  message as a selection.
+
+Consequences:
+
+- An unclassified reply while a question is pending re-asks that question instead of
+  answering something unrelated.
+- A reply to a pending clarification is used as the search query even when the model
+  returns no confident classification.
+- A purchase request no longer collides with a pending clarification; it fulfils it.
+- Storage, transitions, and Amazon access remain agent-owned. `workflow_reply` reads text
+  and returns an intent; it touches nothing else.
+
+---
+
+## ADR-044 — Ordering and Hard Filtering Are Deterministic and Inspectable
+
+Status: Accepted and implemented
+
+Decision:
+
+`ranking.py` owns hard constraint filtering and candidate ordering as pure functions. The
+requested ordering is read from the user's own words. Price ordering uses price per item
+when every candidate states a pack size, and total price otherwise. Every ordering reports
+the basis it used and any limitation, and both are shown to the user.
+
+Context:
+
+`Find me cheap AA batteries.` returned Amazon's extraction order, and extracted constraints
+such as `{"max_price": 20}` were stored on the workflow and never applied — the user's
+stated budget was silently ignored. PRODUCT_REQUIREMENTS specifies two deterministic stages
+(hard filtering, then inspectable ranking) and neither existed.
+
+Reasoning:
+
+- Ordering and budget checks are arithmetic and policy. The playbook and ADR-023 both place
+  those in deterministic code, not in a prompt.
+- A ranking that cannot state its basis cannot be trusted or debugged; returning the basis
+  and caveat with the ordering makes the claim checkable.
+- Comparing a 4-pack to a 48-pack by total price is misleading, so unit price is preferred
+  whenever the facts support it and the fallback is stated out loud.
+- A missing fact is not a violation: a candidate with no price cannot prove it exceeds a
+  budget, so it is kept and listed last rather than dropped.
+
+Tradeoffs:
+
+- Pack size is read from title text, so an unusual title yields no unit price and the
+  comparison falls back to total price.
+- Reading the sort preference from words is a deterministic keyword check. It is a policy
+  check on an already-routed purchase request, not a return to phrase-based routing.
+- Only `max_price`, `min_rating`, and `prime` are enforced; other extracted constraints are
+  stored and ignored rather than guessed at.
+
+Consequences:
+
+- Candidates are persisted in displayed order, so a reply of "3" always means the third
+  line shown.
+- A refinement re-filters and re-orders results already retrieved instead of requiring a
+  new search, and a refinement matching nothing is reported and not persisted.
+- Category-aware weighting from PRODUCT_REQUIREMENTS remains future work; this is the
+  price/rating subset with honest reporting.
+
+---
+
+## ADR-045 — Conversation About Candidates Receives the Candidate Facts
+
+Status: Accepted and implemented
+
+Decision:
+
+When a workflow with stored candidates is active, ordinary conversation is sent to the model
+with those candidates serialized as structured context. Presentation of candidates to the
+user lives in `product_display.py`; serialization of candidates for the model lives in
+`product_evaluator.candidate_context()`.
+
+Context:
+
+The user asking "what's the difference between the first two?" reached `_general_response()`,
+which sent only the raw message. The purchasing system prompt tells the model to summarize
+only facts supplied by the application, and the application supplied none — so the model
+could only refuse or invent. The safety prompt was correct and the plumbing defeated it.
+
+Reasoning:
+
+- ADR-023 makes the model an evaluator of supplied facts. A question about products already
+  retrieved is exactly that, and the facts were already stored.
+- Supplying facts is a stronger anti-hallucination control than instructing the model not to
+  invent them.
+- One path handles both cases: an unrelated question is still answered normally, so no
+  additional routing decision or classifier field is required.
+
+Tradeoffs:
+
+- Every conversational turn during an active workflow carries a larger prompt.
+- The model can still misread supplied facts; the prompt boundary remains the only control
+  on its prose, and no deterministic claim checker exists yet.
+
+Consequences:
+
+- Presentation and model-facing serialization stay in separate modules with separate formats:
+  Telegram text for the user, compact JSON for the model.
+- Conversation with no active workflow is unchanged and carries no product context.
+
+---
+
+## ADR-046 — An Abandoned Workflow Expires Instead of Blocking Every Later Request
+
+Status: Accepted and implemented; refines ADR-030
+
+Decision:
+
+`workflow_store.get_active_workflow()` treats a workflow untouched for longer than
+`MAX_ACTIVE_WORKFLOW_AGE` (24 hours) as inactive. The stored row is kept for inspection; an
+unparseable or missing timestamp is treated as fresh, never as expired.
+
+Context:
+
+ADR-030 requires the user to cancel an active workflow before starting another. Combined with
+a workflow that is never completed — the normal outcome, since checkout does not exist — an
+abandoned search from days earlier permanently rejected every new purchase request. Recovery
+required knowing to type "cancel".
+
+Reasoning:
+
+- A conversational agent must not have a state the user can enter and not know how to leave.
+- Expiry is a lifecycle policy over persisted state, so it belongs with persistence.
+- Failing toward "still active" on a bad timestamp preserves the ADR-030 guarantee when the
+  age cannot be established.
+
+Tradeoffs:
+
+- A genuinely long-running deliberation is dropped after a day.
+- The threshold is a fixed constant rather than configuration.
+
+Consequences:
+
+- ADR-030's one-active-workflow rule still holds; it is now bounded in time.
+- When cart and checkout are implemented, an expiring workflow must not be able to strand a
+  prepared order: expiry policy has to be revisited alongside the ADR-026 confirmation gate.

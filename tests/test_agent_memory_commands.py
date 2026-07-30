@@ -2,205 +2,129 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
+
 import agent
 import amazon
 import intent_classifier
 import memory
 import product_evaluator
-from request_context import RequestContext
+import workflow_store
+from response_policy import GENERAL_RESPONSE_MAX_TOKENS, PURCHASING_AGENT_SYSTEM_PROMPT
+from workflow_models import WorkflowState
 
 
-def test_remember_command_stores_value_without_calling_llm(tmp_path: Path, monkeypatch):
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-    database_path = tmp_path / "memory.db"
+def _action(route, action="no_match", **kwargs):
+    return intent_classifier.SemanticAction(route, action, confidence=0.99, **kwargs)
+
+
+def test_explicit_memory_alias_remains_deterministic(tmp_path: Path, monkeypatch):
+    generate = AsyncMock()
+    monkeypatch.setattr(agent, "generate_response", generate)
+    path = tmp_path / "memory.db"
+    assert asyncio.run(agent.agent_brain("remember: favorite toothpaste = Sensodyne", path)) == "Remembered 'favorite toothpaste'."
+    assert asyncio.run(agent.agent_brain("recall: favorite toothpaste", path)) == "Memory for 'favorite toothpaste': Sensodyne"
+    assert asyncio.run(agent.agent_brain("forget: favorite toothpaste", path)) == "Forgot 'favorite toothpaste'."
+    generate.assert_not_awaited()
+
+
+def test_validated_semantic_memory_action_executes_deterministically(tmp_path, monkeypatch):
+    path = tmp_path / "memory.db"
+    interpret = AsyncMock(side_effect=[
+        _action("memory", "remember", key="favorite toothpaste", value="Sensodyne"),
+        _action("memory", "recall", key="favorite toothpaste"),
+        _action("memory", "forget", key="favorite toothpaste"),
+    ])
+    monkeypatch.setattr(agent.intent_classifier, "interpret_message", interpret)
+    assert asyncio.run(agent.agent_brain("Remember it naturally", path)) == "Remembered 'favorite toothpaste'."
+    assert asyncio.run(agent.agent_brain("Ask naturally", path)) == "Memory for 'favorite toothpaste': Sensodyne"
+    assert asyncio.run(agent.agent_brain("Remove it naturally", path)) == "Forgot 'favorite toothpaste'."
+    assert memory.recall("favorite toothpaste", path) is None
+
+
+def test_no_match_continues_to_general_chat_without_usage_text(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(return_value=_action("unknown")))
+    generate = AsyncMock(return_value="Paris")
+    monkeypatch.setattr(agent, "generate_response", generate)
+    response = asyncio.run(agent.agent_brain("What is the capital of France?", tmp_path / "memory.db"))
+    assert response == "Paris"
+    assert "usage" not in response.lower()
+    assert memory.recall("favorite toothpaste", tmp_path / "memory.db") is None
+    generate.assert_awaited_once_with(
+        "What is the capital of France?",
+        max_tokens=GENERAL_RESPONSE_MAX_TOKENS,
+        system_prompt=PURCHASING_AGENT_SYSTEM_PROMPT,
+    )
+
+
+def test_shopping_no_match_asks_what_to_search_and_remembers_asking(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(return_value=_action("unknown")))
+    generate = AsyncMock()
+    monkeypatch.setattr(agent, "generate_response", generate)
+    workflow_path = tmp_path / "workflows.db"
 
     response = asyncio.run(
-        agent.agent_brain(" ReMeMbEr: favorite_toothpaste = Sensodyne ", database_path)
-    )
-
-    assert response == "Remembered 'favorite_toothpaste'."
-    assert memory.recall("favorite_toothpaste", database_path) == "Sensodyne"
-    generate_response.assert_not_awaited()
-
-
-def test_recall_command_returns_stored_value_without_calling_llm(
-    tmp_path: Path, monkeypatch
-):
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-    database_path = tmp_path / "memory.db"
-    memory.remember("favorite_toothpaste", "Sensodyne", database_path)
-
-    response = asyncio.run(agent.agent_brain("RECALL: favorite_toothpaste", database_path))
-
-    assert response == "Memory for 'favorite_toothpaste': Sensodyne"
-    generate_response.assert_not_awaited()
-
-
-def test_missing_recall_returns_deterministic_response_without_calling_llm(
-    tmp_path: Path, monkeypatch
-):
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-
-    response = asyncio.run(agent.agent_brain("recall: missing", tmp_path / "memory.db"))
-
-    assert response == "Nothing is stored for 'missing'."
-    generate_response.assert_not_awaited()
-
-
-def test_forget_command_removes_value_without_calling_llm(tmp_path: Path, monkeypatch):
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-    database_path = tmp_path / "memory.db"
-    memory.remember("favorite_toothpaste", "Sensodyne", database_path)
-
-    response = asyncio.run(agent.agent_brain("forget: favorite_toothpaste", database_path))
-
-    assert response == "Forgot 'favorite_toothpaste'."
-    assert memory.recall("favorite_toothpaste", database_path) is None
-    generate_response.assert_not_awaited()
-
-
-def test_malformed_remember_command_returns_usage(tmp_path: Path, monkeypatch):
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-
-    response = asyncio.run(agent.agent_brain("remember favorite_toothpaste", tmp_path / "memory.db"))
-
-    assert response == agent.MEMORY_USAGE
-    generate_response.assert_not_awaited()
-
-
-def test_empty_memory_key_returns_usage(tmp_path: Path, monkeypatch):
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-
-    response = asyncio.run(agent.agent_brain("remember: = Sensodyne", tmp_path / "memory.db"))
-
-    assert response == agent.MEMORY_USAGE
-    generate_response.assert_not_awaited()
-
-
-def test_ordinary_message_still_calls_llm(tmp_path: Path, monkeypatch):
-    generate_response = AsyncMock(return_value="Local model reply")
-    classify_intent = AsyncMock(
-        return_value=intent_classifier.IntentResult("general_chat", 0.9, {})
-    )
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-    monkeypatch.setattr(agent.intent_classifier, "classify_intent", classify_intent)
-
-    response = asyncio.run(agent.agent_brain("What toothpaste should I buy?", tmp_path / "memory.db"))
-
-    assert response == "Local model reply"
-    generate_response.assert_awaited_once_with("What toothpaste should I buy?")
-
-
-def test_natural_memory_remember_routes_to_existing_memory_storage(
-    tmp_path: Path, monkeypatch
-):
-    classify_intent = AsyncMock(
-        return_value=intent_classifier.IntentResult(
-            "memory_remember",
-            0.95,
-            {"key": "preferred toothpaste", "value": "Sensodyne"},
+        agent.agent_brain(
+            "I was thinking you find the best options for Sensodyne 3 packs. Cheapest",
+            tmp_path / "memory.db",
+            workflow_path,
+            5,
         )
     )
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent.intent_classifier, "classify_intent", classify_intent)
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-    database_path = tmp_path / "memory.db"
 
-    response = asyncio.run(
-        agent.agent_brain("Remember that I prefer Sensodyne.", database_path)
-    )
-
-    assert response == "Remembered 'preferred toothpaste'."
-    assert memory.recall("preferred toothpaste", database_path) == "Sensodyne"
-    generate_response.assert_not_awaited()
+    assert agent.CLARIFICATION_QUESTION in response
+    generate.assert_not_awaited()
+    pending = workflow_store.get_active_workflow(5, workflow_path)
+    assert pending.state == WorkflowState.AWAITING_REQUEST_CLARIFICATION
+    assert pending.pending_question == agent.CLARIFICATION_QUESTION
 
 
-def test_search_command_calls_amazon_and_passes_structured_results_to_evaluator(
-    tmp_path: Path, monkeypatch
-):
-    products = [
-        amazon.Product(
-            title="Reliable AA Batteries",
-            price="$12.99",
-            url="https://www.amazon.com/example",
-            rating=4.6,
-            review_count=1200,
-        )
-    ]
-    search_products = AsyncMock(
-        return_value=products
-    )
-    evaluate_products = AsyncMock(
-        return_value=product_evaluator.EvaluationResult(
-            recommendation="The batteries look like a strong option.",
-            appears_to_be_reorder=False,
-        )
-    )
-    monkeypatch.setattr(agent.amazon, "search_products", search_products)
-    monkeypatch.setattr(agent.product_evaluator, "evaluate_products", evaluate_products)
-
-    response = asyncio.run(agent.agent_brain("search: AA batteries", tmp_path / "memory.db"))
-
-    assert response == "The batteries look like a strong option."
-    search_products.assert_awaited_once_with("AA batteries")
-    context, evaluated_products = evaluate_products.await_args.args
-    assert context == RequestContext(
-        original_user_request="search: AA batteries",
-        intent="amazon_search",
-        search_query="AA batteries",
-        confidence=1.0,
-    )
-    assert evaluated_products == products
+@pytest.mark.parametrize(
+    "message, is_shopping",
+    [
+        ("Find me cheap AA batteries", True),
+        ("What is the best price for toothpaste", True),
+        ("Explain how research papers are peer reviewed", False),
+        ("Tell me about idealism in philosophy", False),
+        ("What is the capital of France?", False),
+    ],
+)
+def test_shopping_markers_match_whole_words_only(message, is_shopping):
+    """"research" and "idealism" contain "search" and "deal" but are not shopping."""
+    assert agent._looks_like_shopping_request(message) is is_shopping
 
 
-def test_natural_search_routes_to_existing_amazon_and_evaluator(
-    tmp_path: Path, monkeypatch
-):
+def test_semantic_soft_timeout_is_diagnostic_and_request_continues(tmp_path, monkeypatch, capsys):
+    async def delayed_interpret(*args, **kwargs):
+        await asyncio.sleep(0.03)
+        return _action("memory", "recall", key="favorite toothpaste")
+
+    monkeypatch.setattr(agent.intent_classifier, "interpret_message", delayed_interpret)
+    monkeypatch.setattr(agent, "SEMANTIC_SOFT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(agent, "SEMANTIC_HARD_TIMEOUT_SECONDS", 0.08)
+    memory.remember("favorite toothpaste", "Sensodyne", tmp_path / "memory.db")
+
+    response = asyncio.run(agent.agent_brain("What toothpaste do I prefer?", tmp_path / "memory.db"))
+
+    assert response == "Memory for 'favorite toothpaste': Sensodyne"
+    assert "[TIMING] semantic interpretation exceeded soft timeout (20s)" in capsys.readouterr().out
+
+
+def test_semantic_hard_timeout_returns_existing_graceful_model_failure(tmp_path, monkeypatch):
+    async def never_finishes(*args, **kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(agent.intent_classifier, "interpret_message", never_finishes)
+    monkeypatch.setattr(agent, "SEMANTIC_SOFT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(agent, "SEMANTIC_HARD_TIMEOUT_SECONDS", 0.02)
+
+    response = asyncio.run(agent.agent_brain("Remember something", tmp_path / "memory.db"))
+
+    assert response == agent.LOCAL_MODEL_FAILURE
+
+
+def test_explicit_search_alias_preserves_existing_read_only_flow(tmp_path, monkeypatch):
     products = [amazon.Product("AA Batteries", "$12.99", "https://example.test")]
-    classify_intent = AsyncMock(
-        return_value=intent_classifier.IntentResult(
-            "amazon_search",
-            0.92,
-            {"search_query": "AA batteries under twenty dollars"},
-            extracted_search_query="AA batteries under twenty dollars",
-        )
-    )
-    search_products = AsyncMock(return_value=products)
-    evaluate_products = AsyncMock(
-        return_value=product_evaluator.EvaluationResult("Recommendation", False)
-    )
-    monkeypatch.setattr(agent.intent_classifier, "classify_intent", classify_intent)
-    monkeypatch.setattr(agent.amazon, "search_products", search_products)
-    monkeypatch.setattr(agent.product_evaluator, "evaluate_products", evaluate_products)
-
-    response = asyncio.run(
-        agent.agent_brain("Find AA batteries under twenty dollars.", tmp_path / "memory.db")
-    )
-
-    assert response == "Recommendation"
-    search_products.assert_awaited_once_with("AA batteries under twenty dollars")
-    context, evaluated_products = evaluate_products.await_args.args
-    assert context.intent == "amazon_search"
-    assert context.confidence == 0.92
-    assert evaluated_products == products
-
-
-def test_search_command_requires_a_query_without_calling_external_boundaries(
-    tmp_path: Path, monkeypatch
-):
-    search_products = AsyncMock()
-    generate_response = AsyncMock()
-    monkeypatch.setattr(agent.amazon, "search_products", search_products)
-    monkeypatch.setattr(agent, "generate_response", generate_response)
-
-    response = asyncio.run(agent.agent_brain("search:   ", tmp_path / "memory.db"))
-
-    assert response == agent.SEARCH_USAGE
-    search_products.assert_not_awaited()
-    generate_response.assert_not_awaited()
+    monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=products))
+    monkeypatch.setattr(agent.product_evaluator, "evaluate_products", AsyncMock(return_value=product_evaluator.EvaluationResult("Recommendation", False)))
+    assert asyncio.run(agent.agent_brain("search: AA batteries", tmp_path / "memory.db")) == "Recommendation"

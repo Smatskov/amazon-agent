@@ -1,0 +1,9 @@
+# Runtime dependencies for the Telegram purchasing agent.
+# Install with: .venv/bin/pip install -r requirements.txt
+# Playwright also needs its browser once: .venv/bin/playwright install chromium
+python-telegram-bot==22.8
+openai==2.47.0
+python-dotenv==1.2.2
+playwright==1.61.0
+# Imported directly by scripts/lm_studio_runtime_probe.py for raw-HTTP comparison.
+httpx==0.28.1

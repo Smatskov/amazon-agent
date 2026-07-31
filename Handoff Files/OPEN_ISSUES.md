@@ -7,6 +7,138 @@ Status values: **OPEN** · **FIXED** (with commit) · **WONTFIX** (with reason)
 
 ---
 
+## DESIGN-001 — Deciding what a message is about — **PROPOSED, not implemented**
+
+Requested: a reliable way to tell a new search, a new purchase, an addition to the
+cart, and a reply about what is already on screen apart from one another.
+
+The failures in session 2 share one cause: **the agent decides what a message means
+without weighing what it just said.** "i prefer the runner up" is only ambiguous if you
+ignore that the previous turn presented a pick and a runner-up.
+
+Proposed rule, evaluated in order and entirely deterministic:
+
+1. **Reference to what is on screen.** If the previous turn presented options or a
+   recommendation, and the message resolves against them — a number, a brand shown, a
+   comparison, "runner up", "the other one" — it is a reply. This wins over everything
+   else, because a reply arriving straight after a question is the most likely message
+   in the conversation.
+2. **Control words.** `cancel`, `reset`, `checkout`, `confirm`, buy phrasing. Already
+   deterministic today.
+3. **Refinement.** A constraint with no new product noun — "under $16", "only Prime",
+   "cheaper" — applies to the current search.
+4. **New product.** A message naming something not on screen. Split further:
+   - *specific* (brand or model named) → add and confirm in one step;
+   - *broad* (category only) → search and present options.
+5. **Question.** Answerable from stored facts, workflow untouched.
+6. **Anything else** → general conversation.
+
+The local model is consulted only where the rule above is genuinely ambiguous, and its
+answer is never allowed to override steps 1 or 2. Today the order is effectively
+inverted: the model routes first and deterministic resolution is a fallback, which is
+how "cheapest" and "the runner up" both got lost.
+
+Open question for the user, carried over from the last session: **when a new product
+request arrives while items are already listed, keep adding to the same list or start
+a new one?** Currently it always keeps adding. Correct for "shampoo and body wash",
+wrong after moving on to something unrelated.
+
+---
+
+## UAT session 2 — 2026-07-30, coffee filters and french press
+
+Nothing below is implemented yet. Logged and awaiting the go-ahead.
+
+### ISSUE-008 — The happy path takes too many turns — **OPEN**
+
+**Seen:** `order coffee filters` → recommendation → `yes` → `checkout` → `confirm`.
+Four turns to buy one cheap, obvious thing.
+
+**Wanted:**
+
+- **Brand named** ("order Melitta coffee filters") → add straight to the cart and show
+  one confirmation. No option list, no separate checkout step.
+- **Broad request** ("order coffee filters") → search and present a clean, scannable
+  list of options.
+
+**Root cause:** `request_mode.COMMAND` currently always produces a single
+recommendation and then still routes through the full `checkout` → `confirm` gate. The
+gate was designed when the end of the flow was a refusal; now that `confirm` writes to
+the real Amazon cart, an extra approval step for a $1.98 item is friction with no
+safety value.
+
+**Plan:** add a third mode between browse and command — a *specific* request (brand or
+model named) short-circuits to add-and-confirm. Collapse `checkout`+`confirm` into one
+approval for single-item lists, keeping the two-step gate only when the list has
+several items or exceeds a value threshold. The order refusal itself does not change.
+
+### ISSUE-009 — Result formatting is dense and shows noise — **OPEN**
+
+**Seen:**
+
+```
+Amazon Basics Basket Coffee Filters for 8-12 Cup Coffee Makers, White, Packaging May Vary, 200 Count
+$1.98 — $0.01 each — 4.8/5 (24,037 reviews) — arrives Mon, Aug 3
+```
+
+**Problems:** review counts are noise once the user trusts the ranking; every fact is
+crammed into one em-dash-separated run-on; the title still carries marketing filler
+("Packaging May Vary").
+
+**Plan:** drop review counts from display (keep them for ranking). Give each option a
+short bolded name line and a compact facts line with price, unit price, and arrival
+only. Trim residual filler phrases from titles. Keep the whole message no longer than
+the current longest reply — a table is acceptable only if it does not add height.
+
+### ISSUE-010 — Raw markdown is shown to the user — **OPEN**
+
+**Seen:** `**Pick one:**` appears literally in Telegram.
+
+**Root cause:** `main.py` sends messages with no `parse_mode`, so Telegram renders the
+asterisks as text. The formatting was written as if it would render and never did.
+
+**Plan:** send with HTML parse mode and escape every value that comes from Amazon or
+the user, since product titles can contain characters that would otherwise break
+parsing. Then bold is genuinely bold and no markup is visible. This also delivers the
+bolded headers asked for in ISSUE-009.
+
+### ISSUE-011 — "i prefer the runner up" started a new search — **OPEN, highest priority**
+
+**Seen:** after a recommendation with a named runner-up, replying `i prefer the runner
+up` searched Amazon for "i prefer the runner up" and returned marathon t-shirts.
+
+**Root cause:** three failures stacked.
+
+1. The recommendation names a runner-up in the text but stores nothing about it. Only
+   the top pick is written to `selected_candidate_id`, so "runner up" refers to
+   something the agent did not persist.
+2. `candidate_resolver` has no concept of "runner up", "the other one", or "the
+   alternative", so resolution failed.
+3. `_new_product_query()` then treated the leftover words as a product and searched.
+   Its `NON_PRODUCT_WORDS` list does not contain `prefer`, `runner`, `up`, or
+   `alternative`.
+
+**Plan:** persist the runner-up alongside the pick; teach the resolver the
+runner-up/other/alternative references; and make the new-search fallback far more
+conservative — a reply arriving immediately after a recommendation should be resolved
+against the presented options first, and only become a search when it clearly names a
+product that is not on screen. Regression tests will cover the exact transcript.
+
+### ISSUE-012 — Refining re-filters instead of searching again — **OPEN**
+
+**Seen:** `under $16` narrowed the existing five results to two, one of which was
+irrelevant, rather than finding five options under $16.
+
+**Root cause:** `_refine_candidates()` deliberately re-filters results already
+retrieved and never re-queries Amazon. That is right for "only the Prime ones" but
+wrong for a budget, where the user wants a fresh set of options that satisfy it.
+
+**Plan:** when a refinement adds a constraint that shrinks the list below a useful
+number, re-run the Amazon search with the constraint applied and present a full set.
+Keep in-place filtering when the current results still yield enough options.
+
+---
+
 ## UAT session 1 — 2026-07-30, first end-to-end Telegram test
 
 Transcript:

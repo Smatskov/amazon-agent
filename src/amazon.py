@@ -19,17 +19,20 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 AMAZON_SEARCH_URL = "https://www.amazon.com/s"
 AMAZON_HOME_URL = "https://www.amazon.com/"
 MAX_SEARCH_RESULTS = 5
-BROWSER_NAVIGATION_TIMEOUT_MS = 8_000
-BROWSER_RESULTS_TIMEOUT_MS = 6_000
+# Heavy result pages (a phone-case search is ~1.5 MB) need longer than a light one.
+BROWSER_NAVIGATION_TIMEOUT_MS = 25_000
+BROWSER_RESULTS_TIMEOUT_MS = 15_000
 BROWSER_CLOSE_TIMEOUT_SECONDS = 5
 DEFAULT_BROWSER_PROFILE_DIR = (
     Path.home() / "Library" / "Application Support" / "Amazon Agent" / "playwright-profile"
 )
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-PRODUCT_TITLE_SELECTOR = (
-    "a.a-link-normal.s-line-clamp-3[href*='/dp/'], "
-    "h2 a.a-link-normal[href*='/dp/'], h2 a[href*='/dp/']"
-)
+# Amazon serves different result layouts for different queries: some wrap the title in
+# <h2><a>, others put the anchor around the <h2>, and the line-clamp class varies with
+# title length. Keying off the ASIN card plus any product link covers every layout seen;
+# the previous clamp-specific selector returned nothing at all for "iphone case".
+PRODUCT_CARD_SELECTOR = "div[data-asin]:not([data-asin=''])"
+PRODUCT_TITLE_SELECTOR = f"{PRODUCT_CARD_SELECTOR} a[href*='/dp/']"
 
 # TODO: Add a separately authorized, read-only Amazon order-history lookup interface.
 
@@ -251,6 +254,22 @@ def _delivery_from_html(html: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+async def _best_title(card, link) -> str | None:
+    """Pick the fuller of the heading and the link text.
+
+    Layouts disagree about which one holds the product name: for a phone-case search
+    the heading has it and the anchor is empty, while for a shampoo search the heading
+    is only the brand ("Head & Shoulders") and the anchor has the full title.
+    """
+    candidates = []
+    heading = card.locator("h2").first
+    if await heading.count():
+        candidates.append(await _text_or_none(heading))
+    candidates.append(await _text_or_none(link))
+    usable = [value for value in candidates if value]
+    return max(usable, key=len) if usable else None
+
+
 def browser_profile_dir() -> Path:
     """Return a local persistent profile directory that is outside the repository."""
     configured = os.getenv("AMAZON_BROWSER_PROFILE_DIR")
@@ -347,7 +366,7 @@ async def _search_in_context(context, query: str) -> list[Product]:
         if not already_matching_query:
             await page.goto(
                 search_url,
-                wait_until="commit",
+                wait_until="domcontentloaded",
                 timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
             )
         try:
@@ -368,25 +387,27 @@ async def _search_in_context(context, query: str) -> list[Product]:
 
         products: list[Product] = []
         seen_urls: set[str] = set()
-        for index in range(await product_links.count()):
+        cards = page.locator(PRODUCT_CARD_SELECTOR)
+        for index in range(await cards.count()):
             if len(products) == MAX_SEARCH_RESULTS:
                 break
 
-            link = product_links.nth(index)
-            if not await link.is_visible():
+            card = cards.nth(index)
+            link = card.locator("a[href*='/dp/']").first
+            if not await link.count():
                 continue
-            title = await _text_or_none(link)
             href = await link.get_attribute("href")
-            if not title or not href:
+            if not href:
                 continue
             url = urljoin(page.url, href)
             if not _is_amazon_product_url(url) or url in seen_urls:
                 continue
 
-            card = link.locator(
-                "xpath=ancestor::div[@data-asin and string-length(@data-asin) > 0][1]"
-            )
-            card_html = await card.inner_html() if await card.count() else ""
+            title = await _best_title(card, link)
+            if not title:
+                continue
+
+            card_html = await card.inner_html()
             price, rating, review_count, prime_eligible = _result_metadata_from_html(
                 card_html
             )

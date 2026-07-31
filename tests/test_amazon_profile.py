@@ -244,6 +244,18 @@ def test_canonical_product_url_filter_rejects_advertising_redirects():
     )
 
 
-def test_current_product_link_selector_targets_amazon_result_titles_not_card_wrappers():
-    assert "s-line-clamp-3" in amazon.PRODUCT_TITLE_SELECTOR
-    assert "data-asin" not in amazon.PRODUCT_TITLE_SELECTOR
+def test_product_selector_is_layout_independent():
+    """A clamp-class selector returned nothing at all for "iphone case" live.
+
+    Amazon serves different result layouts per query, so selection keys off the ASIN
+    card and any product link rather than one layout's class names.
+    """
+    assert "data-asin" in amazon.PRODUCT_CARD_SELECTOR
+    assert "/dp/" in amazon.PRODUCT_TITLE_SELECTOR
+    assert "s-line-clamp" not in amazon.PRODUCT_TITLE_SELECTOR
+
+
+def test_result_timeouts_allow_for_heavy_pages():
+    """A phone-case results page is ~1.5 MB and exceeded the old 6s budget."""
+    assert amazon.BROWSER_RESULTS_TIMEOUT_MS >= 12_000
+    assert amazon.BROWSER_NAVIGATION_TIMEOUT_MS >= 20_000

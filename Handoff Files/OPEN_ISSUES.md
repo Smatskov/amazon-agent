@@ -1,5 +1,11 @@
 # Open Issues
 
+> **UAT session 4 (2026-07-31) closed all five reported failures** by removing the
+> language model from the shopping path entirely (ADR-051). They shared one cause: each
+> landed on the `_general_response()` fallback, which let the model answer. That
+> fallback no longer exists.
+
+
 Running log from live UAT. Newest session at the top. Add findings here as you test;
 each entry records what you saw, the root cause once diagnosed, and its status.
 
@@ -319,3 +325,34 @@ has it. `amazon.remove_from_cart()` exists and is live-verified but nothing call
 
 **Plan:** after a confirmed push, removing an item should also remove it from the real
 Amazon cart, or say plainly that it will not.
+
+
+---
+
+## UAT session 4 — 2026-07-31, the model answering instead of shopping
+
+All five reported failures had one cause and one fix.
+
+### ISSUE-018 — "is there anything in my cart?" answered "I don't have access" — **FIXED**
+Answered from stored state by `state_answer.py`, instantly, and it says plainly that the
+real Amazon cart is not being checked.
+
+### ISSUE-019 — "i need a new iphone 17 charger" claimed no knowledge — **FIXED**
+Searching is now the default for any unrecognised message. Verified live: that exact
+sentence returns iPhone 17 chargers from $7.99.
+
+### ISSUE-020 — "iphone 16 charger" claimed no results — **FIXED**
+Same cause, same fix.
+
+### ISSUE-021 — "bug spray" returned invented products — **FIXED, was the most serious**
+The model produced "Garden Bug Spray: 16oz, organic formula" with markdown asterisks and
+no prices. The prompt forbidding exactly that did not work. The model can no longer write
+anything the user sees, so invention is structurally impossible rather than discouraged.
+
+### ISSUE-022 — "the larger size" lost the context — **FIXED**
+A short phrase pointing at what is on screen now re-shows the numbered menu and asks for
+a number, instead of searching Amazon for those words.
+
+### ISSUE-023 — Quantity can no longer be changed — **OPEN, introduced by this change**
+`_change_quantity` was reachable only through the deleted semantic path. Adding more than
+one of an item is currently not possible. Needs a "Change quantity" menu option.

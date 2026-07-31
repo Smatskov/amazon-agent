@@ -11,6 +11,7 @@ anything; it renders choices and reads one back.
 """
 
 from dataclasses import dataclass
+from html import escape
 from enum import StrEnum
 import re
 from typing import Any
@@ -63,12 +64,16 @@ def choose(message: str, options: list[MenuOption]) -> MenuOption | None:
 
 
 def render(options: list[MenuOption], *, start: int = 1, heading: str | None = None) -> str:
-    """Render the menu as the numbered lines the user replies to."""
+    """Render the menu as the numbered lines the user replies to.
+
+    Labels carry product titles, which are attacker-controlled text, so they are escaped
+    here: an unescaped "&" or "<" in a title would break the whole Telegram message.
+    """
     if not options:
         return ""
-    lines = [f"<b>{heading}</b>"] if heading else []
+    lines = [f"<b>{escape(heading, quote=False)}</b>"] if heading else []
     lines.extend(
-        f"{number} · {option.label}"
+        f"{number} · {escape(option.label, quote=False)}"
         for number, option in enumerate(options, start=start)
     )
     return "\n".join(lines)

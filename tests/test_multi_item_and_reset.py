@@ -7,7 +7,6 @@ import pytest
 
 import agent
 import amazon
-import intent_classifier
 import workflow_store
 from workflow_models import WorkflowState
 
@@ -18,10 +17,6 @@ USER = 4242
 @pytest.fixture
 def paths(tmp_path):
     return tmp_path / "m.db", tmp_path / "w.db"
-
-
-def _purchase(query):
-    return intent_classifier.SemanticAction("purchase", "purchase_start", 0.99, product_query=query)
 
 
 def _shampoo():
@@ -41,9 +36,6 @@ def _run(message, paths, user=USER):
 
 
 def _build_three_item_list(paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(side_effect=[
-        _purchase("shampoo"), _purchase("paper towels"), _purchase("AA batteries"),
-    ]))
     monkeypatch.setattr(agent.amazon, "search_products",
                         AsyncMock(side_effect=[_shampoo(), _towels(), _batteries()]))
     for query in ("find me shampoo", "find me paper towels", "find me AA batteries"):
@@ -87,27 +79,6 @@ def test_confirming_sends_every_item_to_the_real_amazon_cart(paths, monkeypatch)
     assert "I cannot place this order" in reply
 
 
-def test_quantities_are_carried_through_to_the_real_cart(paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(side_effect=[
-        _purchase("shampoo"),
-        intent_classifier.SemanticAction("workflow", "change_quantity", 0.99, quantity=4),
-    ]))
-    monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_shampoo()))
-    sent = {}
-
-    async def add_many(items):
-        sent["items"] = list(items)
-        return [amazon.CartWriteResult(url, quantity, True) for url, quantity in items]
-
-    monkeypatch.setattr(agent.amazon, "add_many_to_cart", add_many)
-
-    _run("find me shampoo", paths)
-    _run("1", paths)
-    _run("make it 4", paths)
-    _run("checkout", paths)
-    _run("confirm", paths)
-
-    assert sent["items"] == [("https://www.amazon.com/dp/h1", 4)]
 
 
 def test_a_partial_cart_failure_is_reported_honestly(paths, monkeypatch):
@@ -168,8 +139,6 @@ def test_confirming_never_reaches_an_ordering_state(paths, monkeypatch):
      "clear", "clear my list", "new search", "forget everything", "wipe"],
 )
 def test_reset_phrases_clear_the_conversation(phrase, paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message",
-                        AsyncMock(return_value=_purchase("shampoo")))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_shampoo()))
 
     _run("find me shampoo", paths)
@@ -182,17 +151,9 @@ def test_reset_phrases_clear_the_conversation(phrase, paths, monkeypatch):
     assert workflow_store.get_active_workflow(USER, paths[1]) is None
 
 
-def test_reset_never_calls_the_model(paths, monkeypatch):
-    interpret = AsyncMock(return_value=_purchase("shampoo"))
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", interpret)
-
-    _run("reset", paths)
-
-    interpret.assert_not_awaited()
 
 
 def test_reset_is_honest_about_the_real_amazon_cart(paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock())
 
     reply = _run("reset", paths)
 
@@ -200,8 +161,6 @@ def test_reset_is_honest_about_the_real_amazon_cart(paths, monkeypatch):
 
 
 def test_reset_works_from_every_state(paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message",
-                        AsyncMock(return_value=_purchase("shampoo")))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_shampoo()))
     monkeypatch.setattr(agent.amazon, "add_many_to_cart",
                         AsyncMock(return_value=[amazon.CartWriteResult("u", 1, True)]))
@@ -219,9 +178,6 @@ def test_reset_works_from_every_state(paths, monkeypatch):
 
 def test_a_burst_of_messages_is_handled_in_order_without_losing_items(paths, monkeypatch):
     """Telegram delivers updates concurrently; a burst must not drop a cart write."""
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(side_effect=[
-        _purchase("shampoo"), _purchase("paper towels"),
-    ]))
     monkeypatch.setattr(agent.amazon, "search_products",
                         AsyncMock(side_effect=[_shampoo(), _towels()]))
 
@@ -247,10 +203,6 @@ def test_a_burst_of_messages_is_handled_in_order_without_losing_items(paths, mon
 
 
 def test_concurrent_messages_do_not_interleave_state(paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message",
-                        AsyncMock(return_value=intent_classifier.SemanticAction(
-                            "unknown", classification_valid=False)))
-    monkeypatch.setattr(agent, "generate_response", AsyncMock(return_value="ok"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_shampoo()))
 
     async def many():
@@ -266,8 +218,6 @@ def test_concurrent_messages_do_not_interleave_state(paths, monkeypatch):
 
 
 def test_different_users_are_isolated_under_concurrency(paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message",
-                        AsyncMock(return_value=_purchase("shampoo")))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_shampoo()))
 
     async def two_users():

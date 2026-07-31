@@ -6,7 +6,6 @@ from pathlib import Path
 import re
 from time import perf_counter
 
-from llm_client import generate_response
 import amazon
 import candidate_resolver
 import cart
@@ -17,15 +16,9 @@ import memory
 import menu
 from menu import MenuAction
 import product_display
-import product_evaluator
 import ranking
-from request_context import RequestContext
 import request_mode
-from response_policy import (
-    GENERAL_RESPONSE_MAX_TOKENS,
-    PURCHASING_AGENT_SYSTEM_PROMPT,
-    normalize_general_response,
-)
+import state_answer
 from timing import RequestTiming
 import workflow_reply
 import workflow_store
@@ -36,35 +29,11 @@ MEMORY_USAGE = (
     "Memory usage: remember: <key> = <value>; "
     "recall: <key>; forget: <key>."
 )
-SEARCH_USAGE = "Search usage: search: <query>."
-SEMANTIC_SOFT_TIMEOUT_SECONDS = 20.0
-SEMANTIC_HARD_TIMEOUT_SECONDS = 120.0
 MEMORY_CLASSIFICATION_FAILURE = "I couldn't understand that memory request safely."
 LOCAL_MODEL_FAILURE = (
     "I couldn't reach the local AI model. "
     "Make sure LM Studio and its server are running."
 )
-SHOPPING_FALLBACK_MARKERS = (
-    "buy",
-    "find",
-    "search",
-    "shop",
-    "cheap",
-    "cheapest",
-    "best option",
-    "best options",
-    "price",
-    "prices",
-    "deal",
-    "deals",
-)
-# Whole-word matching only: substring matching made "research" and "idealism"
-# look like shopping requests.
-_SHOPPING_MARKER_PATTERN = re.compile(
-    r"\b(?:%s)\b" % "|".join(re.escape(marker) for marker in SHOPPING_FALLBACK_MARKERS)
-)
-
-
 def _memory_response(
     action: str,
     key: str | None,
@@ -120,19 +89,6 @@ def _memory_instruction(message: str) -> tuple[str, str, str | None] | None:
     return normalized_command, key, None
 
 
-def _search_query(message: str) -> str | None:
-    """Return an explicit Amazon query without interpreting ordinary messages."""
-    text = message.strip()
-    command, separator, details = text.partition(":")
-    if command.strip().lower() != "search":
-        return None
-    if not separator:
-        # A bare "search" is a request, not the colon alias. Returning usage text here
-        # made the agent answer an ordinary word with developer documentation.
-        return None
-    return details.strip()
-
-
 DELIVERY_QUESTION = re.compile(
     r"\b(?:how long|when will|when would|when do|arrive|arrives|arrival|delivery|"
     r"delivered|deliver|get here|ship by|shipping time)\b"
@@ -143,11 +99,13 @@ def _asks_about_delivery(message: str) -> bool:
     return bool(DELIVERY_QUESTION.search(message.casefold()))
 
 
-def _looks_like_shopping_request(message: str) -> bool:
-    """Block semantic no-matches from becoming ungrounded shopping advice."""
-    return bool(_SHOPPING_MARKER_PATTERN.search(message.casefold()))
 
 
+# The only gate that still reaches a language model. Everything else is deterministic.
+MEMORY_HINT = re.compile(
+    r"\b(?:remember|recall|forget|memoris|memoriz)\w*\b"
+    r"|\bwhat(?:'s| is| was)?\s+my\b|\bmy (?:favou?rite|usual|preferred)\b"
+)
 CLARIFICATION_QUESTION = "Which product should I search for on Amazon?"
 RESET_COMMAND = re.compile(
     r"^(?:/)?(?:reset|start over|start again|clear|clear (?:my )?list|"
@@ -155,22 +113,6 @@ RESET_COMMAND = re.compile(
 )
 
 
-def _ask_what_to_search(
-    telegram_user_id: int, message: str, workflow_database_path: str | Path
-) -> str:
-    """Ask what to search for, and persist the question so the answer has meaning.
-
-    Previously the agent asked a clarifying question and stored nothing, so the reply
-    arrived with no context and was treated as an unrelated message.
-    """
-    workflow = PurchaseWorkflow.new(telegram_user_id, message, "")
-    workflow_store.transition(
-        workflow,
-        WorkflowState.AWAITING_REQUEST_CLARIFICATION,
-        pending_question=CLARIFICATION_QUESTION,
-    )
-    workflow_store.save_workflow(workflow, workflow_database_path)
-    return f"I can search Amazon for you. {CLARIFICATION_QUESTION}"
 
 
 def _is_awaiting_clarification(workflow: PurchaseWorkflow | None) -> bool:
@@ -338,45 +280,6 @@ async def _apply_workflow_reply(
 MIN_USEFUL_RESULTS = 3
 
 
-async def _refine_candidates(
-    workflow: PurchaseWorkflow,
-    action: intent_classifier.SemanticAction,
-    message: str,
-    workflow_database_path: str | Path,
-    telegram_user_id: int = 0,
-) -> str:
-    """Narrow the current results, searching again when filtering would leave too few.
-
-    "Only the Prime ones" is a filter over what is already on screen. A budget is not:
-    the user wants options that meet it, and re-filtering five results down to two
-    unrelated leftovers is the wrong answer.
-    """
-    merged = {**workflow.constraints, **action.constraints}
-    outcome = ranking.apply_constraints(workflow.candidates, merged)
-
-    if len(outcome.kept) < MIN_USEFUL_RESULTS and workflow.normalized_product_goal:
-        fresh = await _search_again(workflow, merged, message, workflow_database_path)
-        if fresh is not None:
-            return fresh
-
-    if not outcome.kept:
-        # Never persist a constraint that leaves nothing; the user would be stranded.
-        return (
-            "Nothing I found meets that. Try a different description, or say "
-            "<b>start over</b>."
-        )
-
-    preference = ranking.requested_sort(message)
-    if preference is ranking.SortPreference.RELEVANCE:
-        ranked = ranking.RankedCandidates(outcome.kept, ranking.PREVIOUS_ORDER)
-    else:
-        ranked = ranking.rank(outcome.kept, preference)
-
-    workflow.constraints = merged | {"latest_refinement": message}
-    workflow.candidates = ranked.candidates
-    return _show_results(
-        workflow, ranked, workflow_database_path, removed=outcome.removed, refined=True
-    )
 
 
 async def _search_again(
@@ -410,39 +313,39 @@ async def _search_again(
     )
 
 
-REQUEST_PREFIX = re.compile(
-    r"^(?:i\s+)?(?:need|want|would like|am looking for|looking for|get me|get|find me|find|"
-    r"show me|show|search for|search|buy me|buy|order|add)\s+", re.IGNORECASE
-)
-# Words that mean "act on what is already here", not "search for something new".
-NON_PRODUCT_WORDS = frozenset(
-    """yes no ok okay sure thanks please cancel stop first second third fourth fifth last
-    one two three four five it that this them those these cheaper cheapest rated review
-    reviews price prices what which how why when who where does do is are the a an and or
-    but hmm actually maybe about something else other others another different instead
-    anything else something option options list cart them all any more some""".split()
-)
+async def _narrow(
+    workflow: PurchaseWorkflow, message: str, workflow_database_path: str | Path
+) -> str:
+    """Apply a narrowing instruction, searching again if too little would be left."""
+    constraints = {**workflow.constraints, **ranking.parse_constraint(message)}
+    outcome = ranking.apply_constraints(workflow.candidates, constraints)
 
+    if len(outcome.kept) < MIN_USEFUL_RESULTS and workflow.normalized_product_goal:
+        fresh = await _search_again(workflow, constraints, message, workflow_database_path)
+        if fresh is not None:
+            return fresh
 
-def _new_product_query(message: str, workflow: PurchaseWorkflow) -> str | None:
-    """Return a search query when the message names a product not already shown.
+    if not outcome.kept:
+        workflow_store.transition(
+            workflow, WorkflowState.AWAITING_PRODUCT_SELECTION, pending_question="Which one?"
+        )
+        ranked = ranking.RankedCandidates(workflow.candidates, ranking.PREVIOUS_ORDER)
+        return (
+            "Nothing I found matches that.\n\n"
+            + _show_results(workflow, ranked, workflow_database_path)
+        )
 
-    "i need head and shoulders" during a shampoo search is a new search, not an
-    unanswerable reply. Anything that only refers to what is on screen returns None.
-    """
-    stripped = REQUEST_PREFIX.sub("", message.strip()).strip()
-    if not stripped:
-        return None
-    words = [word for word in re.findall(r"[a-z0-9']+", stripped.casefold())]
-    meaningful = [word for word in words if word not in NON_PRODUCT_WORDS and len(word) > 2]
-    if not meaningful:
-        return None
-    # If every meaningful word already appears in the results, the user is referring to
-    # them rather than asking for something else.
-    shown = " ".join(candidate.title.casefold() for candidate in workflow.candidates)
-    if all(word in shown for word in meaningful):
-        return None
-    return stripped
+    workflow.constraints = constraints
+    preference = ranking.requested_sort(message)
+    ranked = (
+        ranking.RankedCandidates(outcome.kept, ranking.PREVIOUS_ORDER)
+        if preference is ranking.SortPreference.RELEVANCE
+        else ranking.rank(outcome.kept, preference)
+    )
+    workflow.candidates = ranked.candidates
+    return _show_results(
+        workflow, ranked, workflow_database_path, removed=outcome.removed, refined=True
+    )
 
 
 def _resolve_or_research(
@@ -458,6 +361,27 @@ def _resolve_or_research(
     if resolution.candidate:
         return _select_candidate(workflow, resolution.candidate, workflow_database_path)
     return resolution.message or _reask_pending_question(workflow, workflow_database_path)
+
+
+def _last_referenced_candidate(workflow: PurchaseWorkflow) -> Candidate | None:
+    """Resolve "it" or "that" to whatever the user most recently picked."""
+    if not workflow.selected_candidate_id:
+        return None
+    return next(
+        (
+            candidate
+            for candidate in workflow.candidates
+            if candidate.candidate_id == workflow.selected_candidate_id
+        ),
+        None,
+    )
+
+
+def _is_legacy_mock_workflow(workflow: PurchaseWorkflow) -> bool:
+    """Prevent old fabricated candidate records from remaining selectable after upgrade."""
+    return bool(workflow.candidates) and all(
+        not candidate.source_url for candidate in workflow.candidates
+    )
 
 
 def _cancel_workflow(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
@@ -519,34 +443,6 @@ def _cart_as_candidates(workflow: PurchaseWorkflow) -> list[Candidate]:
     ]
 
 
-def _remove_from_cart(
-    workflow: PurchaseWorkflow, message: str, workflow_database_path: str | Path
-) -> str:
-    if not workflow.cart:
-        return "Your list is already empty."
-    if len(workflow.cart) == 1:
-        target = workflow.cart[0].candidate_id
-    else:
-        resolution = candidate_resolver.resolve_candidate_reference(
-            message, _cart_as_candidates(workflow)
-        )
-        if not resolution.candidate:
-            return f"{resolution.message}\n\n{_show_cart(workflow, workflow_database_path)}"
-        target = resolution.candidate.candidate_id
-
-    removed = cart.find(workflow.cart, target)
-    workflow.cart = cart.remove(workflow.cart, target)
-    workflow.confirmed_token = None
-    workflow_store.transition(
-        workflow,
-        WorkflowState.PREPARING_CART,
-        pending_question="Add anything else, or check out?",
-    )
-    workflow_store.save_workflow(workflow, workflow_database_path)
-    return (
-        f"Removed {product_display.display_title(removed.title)}.\n\n"
-        f"{_show_cart(workflow, workflow_database_path)}"
-    )
 
 
 def _begin_checkout(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
@@ -629,38 +525,6 @@ async def _push_to_amazon_cart(workflow: PurchaseWorkflow) -> str:
     return "\n".join(lines)
 
 
-async def _general_response(message: str, workflow: PurchaseWorkflow | None = None) -> str:
-    """Generate bounded conversation, supplying the options on screen as facts."""
-    prompt = message
-    if workflow and (workflow.candidates or workflow.cart):
-        context = []
-        if workflow.candidates:
-            context.append(
-                "Numbered Amazon results currently shown: "
-                f"{product_evaluator.candidate_context(workflow.candidates)}"
-            )
-        # Without this the model answers "what's in my cart?" from nothing and can
-        # contradict the list the agent just printed.
-        context.append(
-            "Items on this user's list right now: "
-            f"{product_evaluator.cart_context(workflow.cart)}"
-            if workflow.cart
-            else "This user's list is currently empty."
-        )
-        joined = "\n".join(context)
-        prompt = (
-            f"{message}\n\n"
-            "Context. Answer from these facts when the question is about them, and never "
-            f"add facts that are not listed:\n{joined}"
-        )
-    response = await generate_response(
-        prompt,
-        max_tokens=GENERAL_RESPONSE_MAX_TOKENS,
-        system_prompt=PURCHASING_AGENT_SYSTEM_PROMPT,
-    )
-    return normalize_general_response(response)
-
-
 _USER_LOCKS: dict[int, asyncio.Lock] = {}
 
 
@@ -729,12 +593,6 @@ async def _handle_message(
             "you don't want it. What would you like to look for?"
         )
 
-    search_query = _search_query(message)
-    if search_query is not None:
-        if not search_query:
-            return SEARCH_USAGE
-        return await _search_and_evaluate(message, search_query)
-
     active_workflow = workflow_store.get_active_workflow(
         telegram_user_id, workflow_database_path
     )
@@ -767,104 +625,116 @@ async def _handle_message(
                 active_workflow, reply, workflow_database_path, message
             )
 
-    timing.mark_prepare_complete()
-    semantic_task = asyncio.create_task(
-        intent_classifier.interpret_message(
-            message,
-            workflow_summary=_workflow_summary(active_workflow),
-            pending_question=active_workflow.pending_question if active_workflow else None,
-            timing=timing,
-        )
-    )
-    try:
-        semantic_action = await asyncio.wait_for(asyncio.shield(semantic_task), timeout=SEMANTIC_SOFT_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        print("[TIMING] semantic interpretation exceeded soft timeout (20s)")
-        try:
-            semantic_action = await asyncio.wait_for(
-                semantic_task,
-                timeout=SEMANTIC_HARD_TIMEOUT_SECONDS - SEMANTIC_SOFT_TIMEOUT_SECONDS,
+    if MEMORY_HINT.search(message.casefold()):
+        request = await intent_classifier.interpret_memory(message)
+        if request.is_actionable:
+            print(f"[ROUTING] memory {request.action}")
+            return _memory_response(
+                request.action, request.key, request.value, memory_database_path
             )
-        except asyncio.TimeoutError:
-            semantic_task.cancel()
-            await asyncio.gather(semantic_task, return_exceptions=True)
-            print("[SEMANTIC DEBUG] interpretation reached hard timeout (120s)")
-            timing.log()
-            return LOCAL_MODEL_FAILURE
-    except asyncio.CancelledError:
-        semantic_task.cancel()
-        await asyncio.gather(semantic_task, return_exceptions=True)
-        raise
 
-    try:
-        action_started_at = perf_counter()
-        print(
-            "[ROUTING] "
-            f"route={semantic_action.route} action={semantic_action.action} "
-            f"confidence={semantic_action.confidence:.2f} "
-            f"classification_valid={semantic_action.classification_valid}"
+    # The user asked to narrow, so this message is the narrowing instruction.
+    if active_workflow and active_workflow.state == WorkflowState.REFINING_SEARCH:
+        print("[ROUTING] narrowing instruction")
+        return await _narrow(active_workflow, message, workflow_database_path)
+
+    # Steps 3-5 of the routing contract. Nothing below reaches a language model, and
+    # nothing below can produce model-written text.
+    if active_workflow and active_workflow.candidates:
+        # A reference to something already on screen beats starting a new search.
+        resolution = candidate_resolver.resolve_candidate_reference(
+            message, active_workflow.candidates
         )
-        if semantic_action.route == "memory" and semantic_action.action in {"remember", "recall", "forget"}:
-            return _memory_response(semantic_action.action, semantic_action.key, semantic_action.value, memory_database_path)
-        if semantic_action.route == "purchase" and semantic_action.action == "purchase_start":
-            # Shopping is iterative: a second request searches again and keeps the
-            # list, so several products can be gathered in one conversation.
-            return await _start_purchase_workflow(
-                telegram_user_id,
-                message,
-                semantic_action.product_query or "product",
-                workflow_database_path,
-                constraints=semantic_action.constraints,
-                quantity=semantic_action.quantity,
-                existing=active_workflow,
+        if resolution.candidate:
+            print("[ROUTING] reference to a shown option")
+            return _select_candidate(
+                active_workflow, resolution.candidate, workflow_database_path
             )
-        if active_workflow and semantic_action.route == "workflow" and semantic_action.action != "no_match":
-            return await _continue_purchase_workflow(active_workflow, semantic_action, message, workflow_database_path)
-        if _is_awaiting_clarification(active_workflow) and semantic_action.route != "general_chat":
-            # The agent asked what to search for, so this reply is the answer.
-            return await _start_purchase_workflow(
-                telegram_user_id,
-                message,
-                message.strip(),
-                workflow_database_path,
-                existing=active_workflow,
+        if resolution.ambiguous:
+            return resolution.message
+        if DEICTIC_REFERENCE.match(message.strip()):
+            # "the larger size" points at what is on screen. Searching Amazon for those
+            # words returns nonsense, so ask which number instead.
+            print("[ROUTING] unresolved reference to a shown option")
+            return (
+                "I'm not sure which one you mean.\n\n"
+                + flow.render_only(active_workflow.pending_menu, "Pick a number:")
             )
-        if (
-            not active_workflow
-            and semantic_action.route in {"purchase", "unknown"}
-            and _looks_like_shopping_request(message)
-        ):
-            return _ask_what_to_search(telegram_user_id, message, workflow_database_path)
-        if active_workflow and semantic_action.route in {"workflow", "unknown"}:
-            # The local model says it does not know. Try the deterministic resolver, and
-            # if the message names something not in the current results, search for it
-            # instead of trapping the user in the same question.
-            resolution = candidate_resolver.resolve_candidate_reference(
-                message, active_workflow.candidates
-            )
-            if resolution.candidate:
-                return _select_candidate(
-                    active_workflow, resolution.candidate, workflow_database_path
-                )
-            new_query = _new_product_query(message, active_workflow)
-            if new_query:
-                return await _start_purchase_workflow(
-                    telegram_user_id,
-                    message,
-                    new_query,
-                    workflow_database_path,
-                    existing=active_workflow,
-                )
-            if resolution.ambiguous:
-                return resolution.message
-            return _reask_pending_question(active_workflow, workflow_database_path)
-        return await _general_response(message, active_workflow)
-    except Exception as error:
-        print(f"LM Studio error: {error}")
-        return LOCAL_MODEL_FAILURE
-    finally:
-        timing.add_action(action_started_at)
-        timing.log()
+
+    question = state_answer.answer(message, active_workflow)
+    if question is not None:
+        print("[ROUTING] question about stored state")
+        return question
+
+    if NOT_SHOPPING.search(message.casefold()):
+        print("[ROUTING] not a shopping request")
+        return _not_a_shopping_request(active_workflow, workflow_database_path)
+
+    # Everything else is a search. Amazon's own search understands ordinary phrasing --
+    # "alright, i need a new iphone 17 charger" returns iPhone 17 chargers -- so the raw
+    # message is a better query than anything a small local model rewrites it into.
+    print("[ROUTING] search")
+    return await _start_purchase_workflow(
+        telegram_user_id,
+        message,
+        _search_terms(message),
+        workflow_database_path,
+        existing=active_workflow,
+    )
+
+
+# Openers that are plainly not shopping. Kept deliberately short: anything not matched
+# here is searched, which is the safe default for a shopping agent.
+NOT_SHOPPING = re.compile(
+    r"^(?:hi|hey|hello|thanks|thank you|ok|okay|sure|lol|test|ping)[.!]?$"
+    r"|^(?:who|why|when|where)\s+(?:is|are|was|were|do|does|did)\b"
+    r"|^what\s+(?:is|are)\s+(?:the\s+)?(?:capital|weather|time|date|meaning)\b"
+    r"|\bcapital of\b|\bweather\b|\btell me a joke\b"
+)
+# Words that describe the asking, not the product. Stripped so the Amazon query is the
+# thing wanted rather than the sentence around it.
+REQUEST_NOISE = re.compile(
+    r"\b(?:alright|okay|ok|so|well|hey|please|thanks|actually|just|now|can you|could you|"
+    r"would you|i need|i want|i'd like|i would like|go ahead and|for me|to my cart|"
+    r"in my cart|to the cart|my cart)\b",
+    re.IGNORECASE,
+)
+
+
+LEADING_ARTICLE = re.compile(r"^(?:a|an|the|some|new|another)\s+(?:new\s+)?", re.IGNORECASE)
+# Short phrases that point at something already on screen rather than naming a product.
+DEICTIC_REFERENCE = re.compile(
+    r"^(?:the|that|this|those|these)\s+\w+(?:\s+\w+)?$"
+    r"|^(?:the\s+)?(?:other|larger|bigger|smaller|last|next)\s*(?:one|size|option)?$",
+    re.IGNORECASE,
+)
+
+
+def _search_terms(message: str) -> str:
+    """Trim the request wrapper, keeping the product words.
+
+    Amazon copes with the raw sentence, so this only tidies it. If trimming would leave
+    nothing, the original message is used unchanged rather than searching for "".
+    """
+    trimmed = REQUEST_NOISE.sub(" ", message)
+    trimmed = re.sub(r"[^\w\s$.&'-]", " ", trimmed)
+    trimmed = " ".join(trimmed.split()).strip(" -")
+    # Articles last: punctuation removal can expose a leading "a"/"the".
+    trimmed = LEADING_ARTICLE.sub("", trimmed).strip()
+    return trimmed or message.strip()
+
+
+def _not_a_shopping_request(
+    workflow: PurchaseWorkflow | None, workflow_database_path: str | Path
+) -> str:
+    """One fixed reply. No model, so there is nothing to invent."""
+    reply = (
+        "I'm a shopping agent — I search Amazon and build a list for you.\n\n"
+        "Tell me a product to look for, like <b>bug spray</b> or <b>iphone 17 charger</b>."
+    )
+    if workflow and workflow.pending_menu:
+        return f"{reply}\n\n{flow.render_only(workflow.pending_menu, 'Or pick up where we were:')}"
+    return reply
 
 
 def _price_amount(price_text: str | None) -> float | None:
@@ -1000,127 +870,5 @@ async def _start_purchase_workflow(
     return results
 
 
-async def _continue_purchase_workflow(
-    workflow: PurchaseWorkflow,
-    action: intent_classifier.SemanticAction,
-    message: str,
-    workflow_database_path: str | Path,
-) -> str:
-    """Interpret stored workflow context without cart, checkout, or purchase actions."""
-    if action.action == "cancel":
-        return _cancel_workflow(workflow, workflow_database_path)
-    if action.action == "refine":
-        return await _refine_candidates(workflow, action, message, workflow_database_path)
-    if action.action == "view_cart":
-        return _show_cart(workflow, workflow_database_path)
-    if action.action == "remove_from_cart":
-        return _remove_from_cart(workflow, message, workflow_database_path)
-    if action.action == "checkout":
-        return _begin_checkout(workflow, workflow_database_path)
-    if action.action == "confirm":
-        return await _confirm_order(workflow, workflow_database_path)
-    if action.action == "change_quantity":
-        return _change_quantity(workflow, action, message, workflow_database_path)
-
-    # select_candidate and add_to_cart both mean "I want this one".
-    resolution = candidate_resolver.resolve_candidate_reference(message, workflow.candidates)
-    candidate = resolution.candidate or _last_referenced_candidate(workflow)
-    if not candidate:
-        return resolution.message or "Please choose one of the presented options."
-    return _select_candidate(workflow, candidate, workflow_database_path, action.quantity)
 
 
-def _last_referenced_candidate(workflow: PurchaseWorkflow) -> Candidate | None:
-    """Resolve "it" or "that" to whatever the user most recently picked."""
-    if not workflow.selected_candidate_id:
-        return None
-    return next(
-        (
-            candidate
-            for candidate in workflow.candidates
-            if candidate.candidate_id == workflow.selected_candidate_id
-        ),
-        None,
-    )
-
-
-def _change_quantity(
-    workflow: PurchaseWorkflow,
-    action: intent_classifier.SemanticAction,
-    message: str,
-    workflow_database_path: str | Path,
-) -> str:
-    """Change the quantity of a listed item, or of the next item to be added."""
-    if not action.quantity or action.quantity < 1:
-        return "Please provide a quantity of at least one."
-
-    if not workflow.cart:
-        workflow.quantity = action.quantity
-        workflow_store.save_workflow(workflow, workflow_database_path)
-        return f"I'll use a quantity of {workflow.quantity} for the next item you pick."
-
-    if len(workflow.cart) == 1:
-        target = workflow.cart[0].candidate_id
-    else:
-        resolution = candidate_resolver.resolve_candidate_reference(
-            message, _cart_as_candidates(workflow)
-        )
-        if not resolution.candidate:
-            return f"Which item should be quantity {action.quantity}?\n\n{_show_cart(workflow, workflow_database_path)}"
-        target = resolution.candidate.candidate_id
-
-    workflow.cart = cart.set_quantity(workflow.cart, target, action.quantity)
-    workflow.confirmed_token = None
-    workflow_store.transition(
-        workflow,
-        WorkflowState.PREPARING_CART,
-        pending_question="Add anything else, or check out?",
-    )
-    workflow_store.save_workflow(workflow, workflow_database_path)
-    return _show_cart(workflow, workflow_database_path)
-
-
-def _workflow_summary(workflow: PurchaseWorkflow | None) -> str:
-    """Expose only compact, non-sensitive workflow facts to semantic interpretation."""
-    if not workflow:
-        return ""
-    candidates = ", ".join(candidate.title for candidate in workflow.candidates)
-    return (
-        f"goal={workflow.normalized_product_goal}; state={workflow.state}; "
-        f"quantity={workflow.quantity}; candidates={candidates}"
-    )
-
-
-def _is_legacy_mock_workflow(workflow: PurchaseWorkflow) -> bool:
-    """Prevent old fabricated candidate records from remaining selectable after upgrade."""
-    return bool(workflow.candidates) and all(
-        not candidate.source_url for candidate in workflow.candidates
-    )
-
-
-async def _search_and_evaluate(message: str, search_query: str) -> str:
-    """Execute the explicit `search:` alias flow after agent-owned routing."""
-    context = RequestContext(
-        original_user_request=message,
-        intent="amazon_search",
-        search_query=search_query,
-        confidence=1.0,
-    )
-    try:
-        products = await amazon.search_products(search_query)
-    except amazon.AmazonSearchUnavailable:
-        return "Amazon did not return usable search results right now. Please try again later."
-    except Exception as error:
-        print(f"Amazon search error: {error}")
-        return "I couldn't search Amazon right now. Please try again later."
-    try:
-        evaluation = await product_evaluator.evaluate_products(context, products)
-        # TODO: Add an explicit, confirmed reorder workflow for reorder metadata.
-        # TODO: Check duplicate-order safeguards before any future financial action.
-        return evaluation.recommendation
-    except Exception as error:
-        print(f"Product evaluation error: {error}")
-        return (
-            "I couldn't evaluate the Amazon search results right now. "
-            "Make sure LM Studio and its server are running."
-        )

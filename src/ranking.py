@@ -119,6 +119,53 @@ def requested_sort(message: str) -> SortPreference:
     return SortPreference.RELEVANCE
 
 
+MAX_PRICE_PHRASE = re.compile(
+    r"(?:under|below|less than|cheaper than|max|no more than|<)\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+MIN_RATING_PHRASE = re.compile(
+    r"(?:rated|rating|stars?)\D{0,12}(\d(?:\.\d)?)|(\d(?:\.\d)?)\s*stars?\s*(?:or\s*(?:more|up|better|above))?",
+    re.IGNORECASE,
+)
+PRIME_PHRASE = re.compile(r"\bprime\b", re.IGNORECASE)
+CONSTRAINT_NOISE = frozenset(
+    """only just the a an and or with under below less than more over cheaper max show me
+    ones one option options please product products that is are be by for""".split()
+)
+
+
+def parse_constraint(message: str) -> dict:
+    """Read a narrowing instruction deterministically.
+
+    "under $20", "only prime", "4 stars or more", or a bare brand word. Anything left
+    over becomes a keyword the title must contain, which is how a brand narrows.
+    """
+    constraints: dict = {}
+    lowered = (message or "").casefold()
+
+    price = MAX_PRICE_PHRASE.search(lowered)
+    if price:
+        constraints["max_price"] = float(price.group(1))
+    if PRIME_PHRASE.search(lowered):
+        constraints["prime"] = True
+    rating = MIN_RATING_PHRASE.search(lowered)
+    if rating and "star" in lowered:
+        value = rating.group(1) or rating.group(2)
+        if value and 0 < float(value) <= 5:
+            constraints["min_rating"] = float(value)
+
+    consumed = MAX_PRICE_PHRASE.sub(" ", lowered)
+    consumed = PRIME_PHRASE.sub(" ", consumed)
+    words = [
+        word
+        for word in re.findall(r"[a-z0-9'&-]{3,}", consumed)
+        if word not in CONSTRAINT_NOISE and not word.isdigit()
+    ]
+    if words:
+        constraints["keyword"] = " ".join(words)
+    return constraints
+
+
 def apply_constraints(
     candidates: list[Candidate], constraints: dict | None
 ) -> FilterOutcome:
@@ -129,10 +176,19 @@ def apply_constraints(
     max_price = _number(constraints.get("max_price"))
     min_rating = _number(constraints.get("min_rating"))
     prime_required = constraints.get("prime") is True or constraints.get("prime_required") is True
+    keyword = constraints.get("keyword")
+    keyword_words = (
+        [word for word in str(keyword).casefold().split() if word] if keyword else []
+    )
 
     kept: list[Candidate] = []
     reasons: list[str] = []
     for candidate in candidates:
+        if keyword_words:
+            title = candidate.title.casefold()
+            if not any(word in title for word in keyword_words):
+                _add(reasons, f"not matching '{keyword}'")
+                continue
         # A missing fact is not a violation; it cannot prove the constraint is broken.
         if max_price is not None and candidate.price is not None and candidate.price > max_price:
             _add(reasons, f"over ${max_price:g}")

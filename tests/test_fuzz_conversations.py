@@ -177,9 +177,6 @@ def _check_workflow(workflow, versions):
 def _run_conversation(seed, tmp_path, monkeypatch, turns=14):
     rng = random.Random(seed)
     model = UnreliableModel(rng)
-    monkeypatch.setattr(agent, "generate_response", model)
-    monkeypatch.setattr(agent.intent_classifier, "generate_response", model)
-    monkeypatch.setattr(agent.product_evaluator, "generate_response", model)
 
     async def search(query):
         roll = rng.random()
@@ -232,8 +229,6 @@ def test_no_sequence_of_replies_can_place_an_order(tmp_path, monkeypatch):
         return json.dumps({"action": "no_match", "quantity": None,
                            "constraints": {}, "confidence": 0.9})
 
-    monkeypatch.setattr(agent, "generate_response", reliable)
-    monkeypatch.setattr(agent.intent_classifier, "generate_response", reliable)
     monkeypatch.setattr(agent.amazon, "search_products", AsyncSearch(CATALOGUE))
 
     paths = (tmp_path / "m.db", tmp_path / "w.db")

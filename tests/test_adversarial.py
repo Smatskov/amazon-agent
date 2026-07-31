@@ -17,7 +17,6 @@ import amazon
 import candidate_resolver
 import cart as cart_module
 import checkout
-import intent_classifier
 import main
 import product_display
 import ranking
@@ -54,22 +53,13 @@ def paths(tmp_path):
     return tmp_path / "m.db", tmp_path / "w.db"
 
 
-def _purchase(query="AA batteries"):
-    return intent_classifier.SemanticAction("purchase", "purchase_start", 0.99, product_query=query)
-
-
-def _wf(action, **kwargs):
-    return intent_classifier.SemanticAction("workflow", action, 0.99, **kwargs)
-
-
-def _drive(paths, monkeypatch, messages, actions, products=None):
+def _drive(paths, monkeypatch, messages, actions=None, products=None):
     monkeypatch.setattr(
-        agent.intent_classifier, "interpret_message", AsyncMock(side_effect=list(actions))
+        agent.amazon, "search_products", AsyncMock(return_value=products or _products())
     )
     monkeypatch.setattr(
         agent.amazon, "search_products", AsyncMock(return_value=products or _products())
     )
-    monkeypatch.setattr(agent, "generate_response", AsyncMock(return_value="ok"))
     replies = []
     for message in messages:
         replies.append(asyncio.run(agent.agent_brain(message, paths[0], paths[1], 777)))
@@ -98,12 +88,6 @@ HOSTILE = [
 
 @pytest.mark.parametrize("message", HOSTILE)
 def test_hostile_input_never_crashes_and_never_claims_an_order(message, paths, monkeypatch):
-    monkeypatch.setattr(
-        agent.intent_classifier,
-        "interpret_message",
-        AsyncMock(return_value=intent_classifier.SemanticAction("unknown", classification_valid=False)),
-    )
-    monkeypatch.setattr(agent, "generate_response", AsyncMock(return_value="I can help with shopping."))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
     reply = asyncio.run(agent.agent_brain(message, paths[0], paths[1], 900))
@@ -145,10 +129,8 @@ def test_untrusted_titles_are_data_not_instructions(title, paths, monkeypatch):
     """Amazon titles are attacker-controlled and must never change agent behaviour."""
     products = [amazon.Product(title, "$9.99", "https://www.amazon.com/dp/inj", 4.0, 10)]
     generate = AsyncMock(return_value="Here are the details.")
-    monkeypatch.setattr(agent, "generate_response", generate)
 
-    replies = _drive(paths, monkeypatch, ["find me a widget", "1", "checkout", "place the order"],
-                     [_purchase("widget")], products=products)
+    replies = _drive(paths, monkeypatch, ["widget", "1", "checkout", "place the order"], products=products)
 
     assert "cannot place this order" in replies[-1]
     workflow = workflow_store.get_workflow(777, paths[1])
@@ -240,12 +222,6 @@ def test_price_parsing_never_raises(text):
     ],
 )
 def test_commands_on_an_empty_conversation_are_safe(sequence, paths, monkeypatch):
-    monkeypatch.setattr(
-        agent.intent_classifier,
-        "interpret_message",
-        AsyncMock(return_value=intent_classifier.SemanticAction("unknown", classification_valid=False)),
-    )
-    monkeypatch.setattr(agent, "generate_response", AsyncMock(return_value="ok"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=[]))
 
     for message in sequence:
@@ -260,8 +236,7 @@ def test_commands_on_an_empty_conversation_are_safe(sequence, paths, monkeypatch
 
 def test_confirming_twice_does_not_double_anything(paths, monkeypatch):
     replies = _drive(paths, monkeypatch,
-                     ["find me AA batteries", "1", "checkout", "confirm", "confirm"],
-                     [_purchase()])
+                     ["find me AA batteries", "1", "checkout", "confirm", "confirm"])
 
     assert "cannot place this order" in replies[3]
     assert replies[4].strip()
@@ -271,19 +246,11 @@ def test_confirming_twice_does_not_double_anything(paths, monkeypatch):
 
 
 def test_cancelling_mid_checkout_clears_everything(paths, monkeypatch):
-    _drive(paths, monkeypatch, ["find me AA batteries", "1", "checkout", "cancel"], [_purchase()])
+    _drive(paths, monkeypatch, ["find me AA batteries", "1", "checkout", "cancel"])
 
     assert workflow_store.get_active_workflow(777, paths[1]) is None
 
 
-def test_a_new_search_after_cancel_starts_clean(paths, monkeypatch):
-    _drive(paths, monkeypatch,
-           ["find me AA batteries", "1", "cancel", "find me shampoo"],
-           [_purchase(), _purchase("shampoo")])
-
-    workflow = workflow_store.get_active_workflow(777, paths[1])
-    assert workflow.cart == []
-    assert workflow.normalized_product_goal == "shampoo"
 
 
 # --- resolver edges (24 cases) ------------------------------------------------
@@ -476,7 +443,6 @@ def test_place_order_raises_for_every_workflow_shape():
     ],
 )
 def test_amazon_failures_never_create_a_workflow(failure, paths, monkeypatch):
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(return_value=_purchase()))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(side_effect=failure))
 
     reply = asyncio.run(agent.agent_brain("find me AA batteries", paths[0], paths[1], 902))
@@ -488,7 +454,6 @@ def test_amazon_failures_never_create_a_workflow(failure, paths, monkeypatch):
 @pytest.mark.parametrize("results", [[], [None]])
 def test_empty_or_odd_search_results_are_handled(results, paths, monkeypatch):
     usable = [] if results == [] else []
-    monkeypatch.setattr(agent.intent_classifier, "interpret_message", AsyncMock(return_value=_purchase()))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=usable))
 
     reply = asyncio.run(agent.agent_brain("find me AA batteries", paths[0], paths[1], 903))

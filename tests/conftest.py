@@ -9,6 +9,8 @@ impossible instead of relying on every test remembering to pass a path.
 import pytest
 
 import amazon
+import intent_classifier
+import llm_client
 import memory
 import workflow_store
 
@@ -31,6 +33,23 @@ def no_real_amazon(monkeypatch):
     # any path without blocking the guard checks that raise before reaching it. A test
     # that legitimately drives a fake Playwright simply patches it again.
     monkeypatch.setattr(amazon, "async_playwright", refuse)
+
+
+@pytest.fixture(autouse=True)
+def no_real_model(monkeypatch):
+    """No test may reach LM Studio.
+
+    An unmocked call waits on a 125-second HTTP timeout, which made the suite crawl. A
+    test that needs the model patches `intent_classifier.generate_response` itself.
+    """
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError(
+            "A test tried to reach LM Studio. Mock intent_classifier.generate_response."
+        )
+
+    monkeypatch.setattr(llm_client, "generate_response", refuse)
+    monkeypatch.setattr(intent_classifier, "generate_response", refuse)
 
 
 @pytest.fixture(autouse=True)

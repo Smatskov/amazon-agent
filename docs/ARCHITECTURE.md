@@ -23,13 +23,23 @@ There is no `dialogue_interpreter.py`; hierarchical semantic extraction in `inte
 
 ## Message routing order
 
+Entirely deterministic. No step consults a language model except the memory gate, and no
+step can produce model-written text (ADR-051).
+
 ```text
-1. explicit colon aliases        remember:/recall:/forget:/search:
-2. deterministic workflow reply   yes / no / cancel / "3" — no model call (ADR-043)
-3. semantic interpretation        router → specialist → validated SemanticAction
-4. pending-question fallback      re-ask rather than answer something unrelated
-5. general conversation           candidate facts supplied when a workflow is active
+1. colon aliases            remember:/recall:/forget:
+2. reset                    reset / start over / clear
+3. menu choice              a number read off the last menu
+4. control word             cancel / checkout / confirm / buy phrasing
+5. memory phrasing          the only gate that reaches the model
+6. narrowing instruction    when the user asked to narrow
+7. reference on screen      "the duracell", "cheapest", "the larger size"
+8. state question           cart, total, results, attributes -> state_answer.py
+9. anything else            SEARCH AMAZON with the raw message
 ```
+
+Step 9 is the default. Amazon's own search understands ordinary phrasing, so the raw
+message is a better query than a small model's rewrite of it.
 
 ## Two search paths
 

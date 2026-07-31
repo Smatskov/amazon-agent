@@ -1,10 +1,18 @@
 # Implementation Plan
 
-> **Status note.** This roadmap was written before live Amazon search existed. Milestone 1 is
-> complete and its mocked candidates were replaced by real read-only Amazon results (ADR-038),
-> so Milestone 3 landed early and partially. The current work is not a numbered milestone below:
-> it is repairing Telegram purchase-workflow UX and conversational continuity on top of verified
-> live search. `Handoff Files/PROJECT_STATE.md` is the authoritative current checkpoint.
+> **Status note — this roadmap is superseded.** It was written assuming a conversational
+> agent whose language model routed requests. That design was removed: shopping is now a
+> deterministic numbered-menu flow with no model involvement (ADR-051, ADR-052), and the
+> milestones below no longer describe how the system is built.
+>
+> What actually shipped, against the original milestones: 1 complete but with real Amazon
+> records rather than mocks (ADR-038); 2 complete as `ranking.py`; 3 search complete,
+> product detail not started; 4 not started; 5 replaced — confirming pushes the list to the
+> real Amazon cart (ADR-048) rather than previewing a checkout; 6 partially, the confirmation
+> gate and its versioning exist; 7-9 not started, and 9 remains deliberately unreachable.
+>
+> `Handoff Files/PROJECT_STATE.md` is the authoritative current state, and
+> `Handoff Files/OPEN_ISSUES.md` carries the live findings.
 
 ## Milestone 1 — Conversational router and persistent workflow foundation (complete)
 

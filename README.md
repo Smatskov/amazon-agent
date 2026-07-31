@@ -1,16 +1,35 @@
 # Amazon AI Purchasing Agent
 
-A personal, local-first purchasing assistant controlled through Telegram. A message goes to a
-Telegram bot, a locally hosted language model interprets it, and deterministic Python code
-executes memory and read-only Amazon work.
+A personal, local-first purchasing assistant controlled through Telegram. You send a message,
+it searches Amazon, and you pick from numbered options until your list is ready.
 
-**Status: preview only.** The agent remembers explicit facts, searches Amazon read-only, ranks
-and presents results, answers questions about them, and builds a shopping list through to an
-order summary you can approve.
+**Status: preview.** Shopping is entirely deterministic — no language model takes part, and
+none can write anything you see (ADR-051). It searches, ranks, presents numbered results,
+answers questions from stored facts, builds a list, and prepares an order summary.
 
-It stops there, deliberately. **No code path can place an Amazon order**, and the list it
-builds is its own — nothing is ever added to your real Amazon cart. See
-`Handoff Files/PROJECT_STATE.md` for the current checkpoint and known gaps.
+**Confirming puts your list into your real Amazon cart.** That is the one action that changes
+anything in your account. **It stops there: no code path can place an order** — you complete
+the purchase on Amazon yourself. See `Handoff Files/PROJECT_STATE.md` for the current
+checkpoint and `Handoff Files/OPEN_ISSUES.md` for known gaps.
+
+## How it works
+
+Every reply ends with numbered choices, so you mostly answer with a number:
+
+```
+🔎 Results for iphone 17 charger
+1 · iPhone 17 Charger Fast Charging Type C
+    $9.99 · arrives Mon, Aug 3
+...
+Or:
+6 · Narrow these results
+7 · Search for something else
+8 · Start over
+```
+
+Anything the agent doesn't recognise as a choice, a command, or a question about your list
+is sent to Amazon as a search — Amazon's own search understands ordinary phrasing, so
+"alright, i need a new iphone 17 charger" works as typed.
 
 ## Documentation map
 
@@ -74,22 +93,26 @@ Live checks are deliberate and manual:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -u scripts/amazon_live_probe.py "AA batteries"
-PYTHONPATH=src .venv/bin/python scripts/live_semantic_probe.py
+
 ```
 
 ## Safety
 
-Purchasing is staged: search → recommend → list → checkout preparation → explicit confirmation →
-(not implemented) ordering. Everything up to and including confirmation exists. Ordering does not.
+Purchasing is staged: search → list → checkout summary → explicit confirmation → **ordering
+is not implemented**. Confirmation writes to your real Amazon cart; nothing submits an order.
 
-Three things enforce that, rather than one:
+Four things enforce that, rather than one:
 
-- `amazon.py` exposes only `search_products()` and a manual sign-in helper. There is no cart,
-  checkout, or order function to call.
-- Buy-phrasing ("place the order", "confirm", "buy it now") is matched deterministically before
-  any model call, so a language model can never be the thing that claims an order was placed.
+- `amazon.py` exposes search and cart add/remove only. There is no order function to call, and
+  `_refuse_ordering_url()` blocks navigation to any checkout URL.
+- Cart writes click `#add-to-cart-button` by exact id, so the control can never resolve to
+  "Buy Now", which sits beside it on the product page. Success is confirmed by reading
+  Amazon's own cart badge rather than assumed.
 - `checkout.place_order()` exists only to raise, and tests assert nothing calls it.
+- **No language model can write to you**, so none can claim an order was placed. A test asserts
+  no module outside `intent_classifier` even mentions `generate_response`.
 
-The list the agent builds lives in its own SQLite database. Nothing is added to your Amazon
-cart, and prices are copied from search results rather than recomputed — so a subtotal is the
-sum of what Amazon showed, with shipping, tax, and delivery reported as unknown.
+Set `AMAZON_ENABLE_CART=false` to disable cart writes entirely.
+
+Prices are copied from search results rather than recomputed, so a subtotal is the sum of what
+Amazon showed — with shipping, tax and delivery reported as unknown rather than estimated.

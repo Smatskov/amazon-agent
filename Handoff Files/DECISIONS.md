@@ -1581,3 +1581,63 @@ Consequences:
   that no shopping message reaches the model, and that a whole purchase completes
   without it.
 - ADR-026's order gate is unchanged: ordering is still not implemented and still refused.
+
+---
+
+## ADR-052 — The Conversation Is a Numbered Menu
+
+Status: Accepted and implemented
+
+Note on ordering: this decision was implemented before ADR-051 but recorded after it.
+The log is append-only, so it is added here rather than inserted in sequence.
+
+Decision:
+
+Every reply the agent sends ends with numbered choices, and the menu is persisted with
+the workflow. A numeric reply resolves against exactly the menu the user read, is
+executed before anything else, and never reaches a language model.
+
+Context:
+
+Three separate UAT failures had one shape: the same free text meant different things in
+different places.
+
+- The results footer offered `a brand, like "Employee"` as a way to *narrow*. Typing
+  `employee` *selected* a product and added it to the list.
+- `i prefer the runner up` became an Amazon search for "i prefer the runner up",
+  returning marathon t-shirts.
+- The user's own list rendered identically to search results, so items added earlier
+  read as fresh suggestions.
+
+Each was patched individually and another appeared, because the words the user typed
+genuinely did not distinguish the intents. The agent had to guess, and no amount of
+better guessing removes the ambiguity.
+
+Reasoning:
+
+- A number cannot be misread. Removing the ambiguity beats resolving it better.
+- Persisting the menu means the number shown is the number resolved, even across a
+  restart, so a stale menu cannot select the wrong product.
+- It makes the common path instant: menu actions return in ~0.0s because no model,
+  network, or search is involved.
+- It is the smallest interface that still supports the whole flow: pick, narrow, search
+  again, view list, remove, check out, confirm, start over.
+
+Tradeoffs:
+
+- Less conversational. The user picks from what is offered rather than saying anything.
+- Menus must be rebuilt whenever state changes. Forgetting to do so leaves a stale menu:
+  exactly that bug let "confirm" run twice and push to the real Amazon cart twice, which
+  is now covered by a regression test.
+- Free text still has to work for the opening request, which is why searching is the
+  default for anything unrecognised (ADR-051).
+
+Consequences:
+
+- `menu.py` owns the numbered choices and reading one back; `flow.py` builds the menu for
+  each point in the conversation; `PurchaseWorkflow.pending_menu` persists it.
+- Results are headed with a magnifier and the list with a basket, because rendering them
+  alike is what made a list read as suggestions.
+- Output is Telegram HTML with `parse_mode` set, and every value from Amazon or the user
+  is escaped. Before this, markdown was sent verbatim and the user saw literal
+  `**Pick one:**`.

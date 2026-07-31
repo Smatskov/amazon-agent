@@ -8,7 +8,6 @@ from html.parser import HTMLParser
 import os
 from pathlib import Path
 import re
-from typing import Protocol
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlparse
 
 from playwright.async_api import Error as PlaywrightError
@@ -33,8 +32,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 # the previous clamp-specific selector returned nothing at all for "iphone case".
 PRODUCT_CARD_SELECTOR = "div[data-asin]:not([data-asin=''])"
 PRODUCT_TITLE_SELECTOR = f"{PRODUCT_CARD_SELECTOR} a[href*='/dp/']"
-
-# TODO: Add a separately authorized, read-only Amazon order-history lookup interface.
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,22 +89,6 @@ def _refuse_ordering_url(url: str) -> None:
             raise AmazonCartUnavailable(
                 f"Refusing to navigate to an order URL: {fragment}"
             )
-
-
-class AmazonWorkflowGateway(Protocol):
-    """Future typed boundary; Milestone 1 does not invoke these consequential methods."""
-
-    async def lookup_recent_orders(self, query: str) -> list[Product]: ...
-
-    async def search_products(self, query: str) -> list[Product]: ...
-
-    async def fetch_product_details(self, product_url: str) -> Product: ...
-
-    async def add_to_cart(self, product_url: str, quantity: int) -> None: ...
-
-    async def inspect_checkout(self) -> dict[str, str]: ...
-
-    async def place_confirmed_order(self, confirmation_version: int) -> str: ...
 
 
 async def _text_or_none(locator) -> str | None:
@@ -622,12 +603,27 @@ async def remove_from_cart(asin: str, *, visible: bool = False) -> int | None:
             await page.close()
 
 
+SEARCH_ATTEMPTS = 2
+
+
 async def search_products(query: str) -> list[Product]:
-    """Return up to five visible Amazon search results from the local profile."""
-    try:
-        async with _persistent_browser_context() as context:
-            return await _search_in_context(context, query)
-    except PlaywrightError as error:
-        raise AmazonSearchUnavailable(
-            "The local Amazon browser profile is unavailable or already in use."
-        ) from error
+    """Return up to five visible Amazon search results from the local profile.
+
+    The first search after the browser starts pays a cold-start cost and was observed
+    timing out where an immediate repeat succeeded, so one retry is made before
+    reporting failure. A retry re-reads a public results page; it changes nothing.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, SEARCH_ATTEMPTS + 1):
+        try:
+            async with _persistent_browser_context() as context:
+                return await _search_in_context(context, query)
+        except AmazonSearchUnavailable as error:
+            last_error = error
+            print(f"[AMAZON] search attempt {attempt} found no results: {error}")
+        except PlaywrightError as error:
+            last_error = AmazonSearchUnavailable(
+                "The local Amazon browser profile is unavailable or already in use."
+            )
+            print(f"[AMAZON] search attempt {attempt} browser error: {error}")
+    raise last_error

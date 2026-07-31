@@ -11,8 +11,11 @@ import amazon
 import candidate_resolver
 import cart
 import checkout
+import flow
 import intent_classifier
 import memory
+import menu
+from menu import MenuAction
 import product_display
 import product_evaluator
 import ranking
@@ -100,7 +103,8 @@ def _memory_instruction(message: str) -> tuple[str, str, str | None] | None:
     if normalized_command not in {"remember", "recall", "forget"}:
         return None
     if not separator:
-        return "invalid", "", None
+        # A bare "remember" is ordinary English, not a malformed developer command.
+        return None
 
     if normalized_command == "remember":
         key, value_separator, value = details.partition("=")
@@ -123,7 +127,9 @@ def _search_query(message: str) -> str | None:
     if command.strip().lower() != "search":
         return None
     if not separator:
-        return ""
+        # A bare "search" is a request, not the colon alias. Returning usage text here
+        # made the agent answer an ordinary word with developer documentation.
+        return None
     return details.strip()
 
 
@@ -171,19 +177,101 @@ def _is_awaiting_clarification(workflow: PurchaseWorkflow | None) -> bool:
     return bool(workflow) and workflow.state == WorkflowState.AWAITING_REQUEST_CLARIFICATION
 
 
-def _reask_pending_question(workflow: PurchaseWorkflow) -> str:
+def _show_cart(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
+    options = flow.store(workflow, flow.cart_menu(workflow))
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart), options)
+
+
+def _show_results(
+    workflow: PurchaseWorkflow,
+    ranked,
+    workflow_database_path: str | Path,
+    *,
+    removed: int = 0,
+    refined: bool = False,
+) -> str:
+    picks, actions = flow.results_menu(workflow, ranked.candidates)
+    flow.store(workflow, picks + actions)
+    workflow_store.transition(
+        workflow, WorkflowState.AWAITING_PRODUCT_SELECTION, pending_question="Which one?"
+    )
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return product_display.present_results(
+        workflow.normalized_product_goal, ranked, actions, removed=removed, refined=refined
+    )
+
+
+async def _execute_menu_choice(
+    workflow: PurchaseWorkflow,
+    option: menu.MenuOption,
+    workflow_database_path: str | Path,
+    telegram_user_id: int,
+) -> str:
+    """Run exactly what the user picked. No model, no guessing."""
+    action = option.action
+    if action is MenuAction.CANCEL:
+        return _cancel_workflow(workflow, workflow_database_path)
+    if action is MenuAction.VIEW_LIST:
+        return _show_cart(workflow, workflow_database_path)
+    if action is MenuAction.CHECKOUT:
+        return _begin_checkout(workflow, workflow_database_path)
+    if action is MenuAction.CONFIRM:
+        return await _confirm_order(workflow, workflow_database_path)
+    if action is MenuAction.SELECT:
+        candidate = next(
+            (c for c in workflow.candidates if c.candidate_id == option.payload), None
+        )
+        if candidate is None:
+            return _show_cart(workflow, workflow_database_path)
+        return _select_candidate(workflow, candidate, workflow_database_path)
+    if action is MenuAction.REMOVE:
+        if option.payload:
+            workflow.cart = cart.remove(workflow.cart, option.payload)
+            workflow.confirmed_token = None
+            workflow_store.transition(
+                workflow, WorkflowState.PREPARING_CART, pending_question="Anything else?"
+            )
+            return _show_cart(workflow, workflow_database_path)
+        options = flow.store(workflow, flow.remove_menu(workflow))
+        workflow_store.save_workflow(workflow, workflow_database_path)
+        return "Which item should I remove?\n\n" + flow.render_only(options, "Choose:")
+    if action is MenuAction.SHOW_OPTIONS:
+        ranked = ranking.RankedCandidates(workflow.candidates, ranking.PREVIOUS_ORDER)
+        return _show_results(workflow, ranked, workflow_database_path)
+    if action is MenuAction.NARROW:
+        flow.store(workflow, [])
+        workflow_store.transition(
+            workflow, WorkflowState.REFINING_SEARCH, pending_question="Narrow how?"
+        )
+        workflow_store.save_workflow(workflow, workflow_database_path)
+        return (
+            "What should I narrow by? Type a budget like <b>under $20</b>, a brand, "
+            "or anything else to match."
+        )
+    # NEW_SEARCH and KEEP_SHOPPING both mean: tell me what to look for next.
+    flow.store(workflow, [])
+    workflow_store.transition(
+        workflow,
+        WorkflowState.AWAITING_REQUEST_CLARIFICATION,
+        pending_question=CLARIFICATION_QUESTION,
+    )
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return "What should I look for?"
+
+
+def _reask_pending_question(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
     """Repeat the outstanding question instead of answering something else."""
     if workflow.state == WorkflowState.AWAITING_CHECKOUT_CONFIRMATION:
         return "I'm waiting on your confirmation of the order summary. Reply 'confirm' or 'cancel'."
     if workflow.state == WorkflowState.PREPARING_CART and workflow.cart:
         return (
-            f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}\n\n"
-            "Search for something else to add, or say 'checkout'."
+            _show_cart(workflow, workflow_database_path)
         )
     if workflow.candidates:
         return (
-            f"I'm still on your search for '{workflow.normalized_product_goal}'.\n\n"
-            f"{product_display.next_step_hint(workflow.candidates)}"
+            f"I'm still on your search for '{product_display.text(workflow.normalized_product_goal)}'.\n\n"
+            + flow.render_only(workflow.pending_menu, "Choose:")
         )
     return workflow.pending_question or CLARIFICATION_QUESTION
 
@@ -206,9 +294,7 @@ async def _apply_workflow_reply(
         return _resolve_or_research(workflow, message, workflow_database_path)
     if reply.intent is workflow_reply.ReplyIntent.SHOW_OPTIONS:
         ranked = ranking.RankedCandidates(workflow.candidates, ranking.PREVIOUS_ORDER)
-        return product_display.present_candidates(
-            workflow.normalized_product_goal, ranked
-        )
+        return _show_results(workflow, ranked, workflow_database_path)
 
     if _is_awaiting_clarification(workflow):
         # A bare yes or no is not a product name, so the question still stands.
@@ -229,7 +315,7 @@ async def _apply_workflow_reply(
             workflow_store.save_workflow(workflow, workflow_database_path)
             return (
                 "Not confirmed — nothing was ordered.\n\n"
-                f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+                f"{_show_cart(workflow, workflow_database_path)}"
             )
 
     if reply.intent is workflow_reply.ReplyIntent.SELECT_POSITION:
@@ -243,30 +329,41 @@ async def _apply_workflow_reply(
             return _select_candidate(workflow, pending, workflow_database_path)
         if len(workflow.candidates) == 1:
             return _select_candidate(workflow, workflow.candidates[0], workflow_database_path)
-        return _reask_pending_question(workflow)
+        return _reask_pending_question(workflow, workflow_database_path)
     return (
         "No problem — tell me what to look for instead, or say 'cancel' to stop this search."
     )
 
 
-def _refine_candidates(
+MIN_USEFUL_RESULTS = 3
+
+
+async def _refine_candidates(
     workflow: PurchaseWorkflow,
     action: intent_classifier.SemanticAction,
     message: str,
     workflow_database_path: str | Path,
+    telegram_user_id: int = 0,
 ) -> str:
-    """Re-filter and re-order the results already retrieved, without a new search.
+    """Narrow the current results, searching again when filtering would leave too few.
 
-    A refinement is a normal conversational move ("only the Prime ones", "cheaper"),
-    so it must narrow the list in place rather than telling the user to start over.
+    "Only the Prime ones" is a filter over what is already on screen. A budget is not:
+    the user wants options that meet it, and re-filtering five results down to two
+    unrelated leftovers is the wrong answer.
     """
     merged = {**workflow.constraints, **action.constraints}
     outcome = ranking.apply_constraints(workflow.candidates, merged)
+
+    if len(outcome.kept) < MIN_USEFUL_RESULTS and workflow.normalized_product_goal:
+        fresh = await _search_again(workflow, merged, message, workflow_database_path)
+        if fresh is not None:
+            return fresh
+
     if not outcome.kept:
         # Never persist a constraint that leaves nothing; the user would be stranded.
         return (
-            "None of the results I already have meet that. Say 'cancel' to search "
-            "again with a different description, or pick from the current options."
+            "Nothing I found meets that. Try a different description, or say "
+            "<b>start over</b>."
         )
 
     preference = ranking.requested_sort(message)
@@ -277,18 +374,39 @@ def _refine_candidates(
 
     workflow.constraints = merged | {"latest_refinement": message}
     workflow.candidates = ranked.candidates
-    workflow_store.transition(
-        workflow,
-        WorkflowState.AWAITING_PRODUCT_SELECTION,
-        pending_question="Which candidate would you like?",
+    return _show_results(
+        workflow, ranked, workflow_database_path, removed=outcome.removed, refined=True
     )
-    workflow_store.save_workflow(workflow, workflow_database_path)
-    return product_display.present_candidates(
-        workflow.normalized_product_goal,
-        ranked,
-        removed=outcome.removed,
-        removal_reasons=outcome.reasons,
-        refined=True,
+
+
+async def _search_again(
+    workflow: PurchaseWorkflow,
+    constraints: dict,
+    message: str,
+    workflow_database_path: str | Path,
+) -> str | None:
+    """Re-query Amazon for the same goal, then apply the constraint to fresh results."""
+    try:
+        products = await amazon.search_products(workflow.normalized_product_goal)
+    except Exception as error:  # noqa: BLE001 - fall back to filtering what we have
+        print(f"Amazon re-search error: {error}")
+        return None
+
+    candidates = _candidates_from_products(products)
+    outcome = ranking.apply_constraints(candidates, constraints)
+    if not outcome.kept:
+        return None
+
+    preference = ranking.requested_sort(message)
+    ranked = (
+        ranking.RankedCandidates(outcome.kept, ranking.AMAZON_ORDER)
+        if preference is ranking.SortPreference.RELEVANCE
+        else ranking.rank(outcome.kept, preference)
+    )
+    workflow.constraints = constraints | {"latest_refinement": message}
+    workflow.candidates = ranked.candidates
+    return _show_results(
+        workflow, ranked, workflow_database_path, removed=outcome.removed, refined=True
     )
 
 
@@ -339,7 +457,7 @@ def _resolve_or_research(
     resolution = candidate_resolver.resolve_candidate_reference(message, workflow.candidates)
     if resolution.candidate:
         return _select_candidate(workflow, resolution.candidate, workflow_database_path)
-    return resolution.message or _reask_pending_question(workflow)
+    return resolution.message or _reask_pending_question(workflow, workflow_database_path)
 
 
 def _cancel_workflow(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
@@ -364,7 +482,7 @@ def _select_candidate(
         return (
             f"{product_display.display_title(candidate.title)} is already on your list "
             f"(qty {already_listed.quantity}).\n\n"
-            f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+            f"{_show_cart(workflow, workflow_database_path)}"
         )
 
     quantity = quantity or workflow.quantity
@@ -383,9 +501,7 @@ def _select_candidate(
     return (
         f"Added {product_display.display_title(candidate.title)} "
         f"(qty {line.quantity}).\n\n"
-        f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}\n\n"
-        "Search for something else to add, say 'checkout' to review, "
-        "or 'remove' to take something off."
+        f"{_show_cart(workflow, workflow_database_path)}"
     )
 
 
@@ -415,7 +531,7 @@ def _remove_from_cart(
             message, _cart_as_candidates(workflow)
         )
         if not resolution.candidate:
-            return f"{resolution.message}\n\n{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+            return f"{resolution.message}\n\n{_show_cart(workflow, workflow_database_path)}"
         target = resolution.candidate.candidate_id
 
     removed = cart.find(workflow.cart, target)
@@ -429,7 +545,7 @@ def _remove_from_cart(
     workflow_store.save_workflow(workflow, workflow_database_path)
     return (
         f"Removed {product_display.display_title(removed.title)}.\n\n"
-        f"{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+        f"{_show_cart(workflow, workflow_database_path)}"
     )
 
 
@@ -443,7 +559,9 @@ def _begin_checkout(workflow: PurchaseWorkflow, workflow_database_path: str | Pa
         pending_question="Confirm this order summary?",
     )
     workflow_store.save_workflow(workflow, workflow_database_path)
-    return product_display.present_checkout(summary)
+    options = flow.store(workflow, flow.checkout_menu())
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return product_display.present_checkout(summary, options)
 
 
 async def _confirm_order(workflow: PurchaseWorkflow, workflow_database_path: str | Path) -> str:
@@ -468,12 +586,15 @@ async def _confirm_order(workflow: PurchaseWorkflow, workflow_database_path: str
         WorkflowState.PAUSED,
         pending_question="Open Amazon to complete the order.",
     )
+    # Replace the checkout menu. Leaving it in place meant "1" confirmed a second time
+    # and pushed the same items to the real Amazon cart again.
+    options = flow.store(workflow, flow.done_menu(workflow))
     workflow_store.save_workflow(workflow, workflow_database_path)
     return (
         f"{header}\n\n{transfer}\n\n"
         "I cannot place this order. Ordering is deliberately not implemented — no code "
         "path here can submit a purchase. Open Amazon to complete it.\n\n"
-        "Say 'reset' to start something new."
+        + flow.render_only(options)
     )
 
 
@@ -623,6 +744,19 @@ async def _handle_message(
         print("[WORKFLOW] discarded legacy candidate state without Amazon source URLs")
         active_workflow = None
 
+    # A number the user read off the last menu is the least ambiguous message in the
+    # conversation, so it resolves first and never reaches the model.
+    if active_workflow and active_workflow.pending_menu:
+        picked = menu.choose(message, active_workflow.pending_menu)
+        if picked is not None:
+            print(f"[ROUTING] menu choice {picked.action}")
+            return await _execute_menu_choice(
+                active_workflow, picked, workflow_database_path, telegram_user_id
+            )
+        out_of_range = menu.out_of_range_hint(message, active_workflow.pending_menu)
+        if out_of_range:
+            return out_of_range
+
     # An unambiguous answer to a question the agent just asked is handled here, before
     # any model call, so "3" or "cancel" is instant and cannot be misrouted.
     if active_workflow:
@@ -723,7 +857,7 @@ async def _handle_message(
                 )
             if resolution.ambiguous:
                 return resolution.message
-            return _reask_pending_question(active_workflow)
+            return _reask_pending_question(active_workflow, workflow_database_path)
         return await _general_response(message, active_workflow)
     except Exception as error:
         print(f"LM Studio error: {error}")
@@ -839,6 +973,10 @@ async def _start_purchase_workflow(
         recommendation = ranking.recommend(ranked.candidates, message)
         if recommendation:
             workflow.selected_candidate_id = recommendation.candidate.candidate_id
+            options = flow.store(workflow, flow.recommendation_menu(
+                workflow, recommendation.candidate, recommendation.runner_up,
+                len(ranked.candidates),
+            ))
             workflow_store.transition(
                 workflow,
                 WorkflowState.AWAITING_PRODUCT_SELECTION,
@@ -846,12 +984,10 @@ async def _start_purchase_workflow(
             )
             workflow_store.save_workflow(workflow, workflow_database_path)
             return product_display.present_recommendation(
-                goal, recommendation, len(ranked.candidates)
+                goal, recommendation, len(ranked.candidates), options
             )
 
-    results = product_display.present_candidates(
-        goal, ranked, removed=outcome.removed, removal_reasons=outcome.reasons
-    )
+    results = _show_results(workflow, ranked, workflow_database_path, removed=outcome.removed)
     if _asks_about_delivery(message):
         # Ignoring the question the user actually asked reads as evasive.
         results += (
@@ -860,7 +996,7 @@ async def _start_purchase_workflow(
         )
     if workflow.cart:
         # Searching again must not look like the earlier picks were lost.
-        results += f"\n\nStill on your list: {cart.item_count(workflow.cart)} item(s). Say 'list' to see them."
+        pass
     return results
 
 
@@ -874,9 +1010,9 @@ async def _continue_purchase_workflow(
     if action.action == "cancel":
         return _cancel_workflow(workflow, workflow_database_path)
     if action.action == "refine":
-        return _refine_candidates(workflow, action, message, workflow_database_path)
+        return await _refine_candidates(workflow, action, message, workflow_database_path)
     if action.action == "view_cart":
-        return product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))
+        return _show_cart(workflow, workflow_database_path)
     if action.action == "remove_from_cart":
         return _remove_from_cart(workflow, message, workflow_database_path)
     if action.action == "checkout":
@@ -930,7 +1066,7 @@ def _change_quantity(
             message, _cart_as_candidates(workflow)
         )
         if not resolution.candidate:
-            return f"Which item should be quantity {action.quantity}?\n\n{product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))}"
+            return f"Which item should be quantity {action.quantity}?\n\n{_show_cart(workflow, workflow_database_path)}"
         target = resolution.candidate.candidate_id
 
     workflow.cart = cart.set_quantity(workflow.cart, target, action.quantity)
@@ -941,7 +1077,7 @@ def _change_quantity(
         pending_question="Add anything else, or check out?",
     )
     workflow_store.save_workflow(workflow, workflow_database_path)
-    return product_display.present_cart(workflow.cart, cart.subtotal(workflow.cart))
+    return _show_cart(workflow, workflow_database_path)
 
 
 def _workflow_summary(workflow: PurchaseWorkflow | None) -> str:

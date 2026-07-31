@@ -38,7 +38,7 @@ def test_validated_purchase_starts_preview_workflow_only(tmp_path, monkeypatch):
     memory_path, workflow_path = tmp_path / "memory.db", tmp_path / "workflows.db"
     response = asyncio.run(agent.agent_brain("find me toothpaste", memory_path, workflow_path, 41))
     workflow = workflow_store.get_active_workflow(41, workflow_path)
-    assert "Amazon results" in response
+    assert "Results for" in response
     assert workflow is not None
     assert workflow.state == WorkflowState.AWAITING_PRODUCT_SELECTION
     assert workflow.normalized_product_goal == "toothpaste"
@@ -61,7 +61,7 @@ def test_observed_sensodyne_request_uses_validated_preview_flow(tmp_path, monkey
         agent.agent_brain(message, tmp_path / "memory.db", tmp_path / "workflows.db", 41)
     )
 
-    assert "Amazon results" in response
+    assert "Results for" in response
     assert "Sensodyne Aa Batteries" not in response
     assert "$18.49" in response
     generate.assert_not_awaited()
@@ -107,7 +107,7 @@ def test_legacy_mock_workflow_is_discarded_before_a_new_real_search(tmp_path, mo
 
     response = asyncio.run(agent.agent_brain("Find AA batteries", tmp_path / "memory.db", workflow_path, 41))
 
-    assert "Amazon results" in response
+    assert "Results for" in response
     workflow = workflow_store.get_active_workflow(41, workflow_path)
     assert workflow is not None
     assert all(candidate.source_url for candidate in workflow.candidates)
@@ -149,8 +149,8 @@ def test_a_second_search_reuses_the_workflow_and_keeps_the_list(tmp_path, monkey
     response = asyncio.run(agent.agent_brain("find me shampoo", memory_path, workflow_path, 3))
 
     assert "already have" not in response
-    assert "Amazon results" in response
-    assert "Still on your list: 1 item(s)" in response
+    assert "Results for" in response
+    assert "View your list" in response
     workflow = workflow_store.get_active_workflow(3, workflow_path)
     assert workflow.normalized_product_goal == "shampoo"
     assert len(workflow.cart) == 1

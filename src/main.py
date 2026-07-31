@@ -1,9 +1,14 @@
 # Entry point for the application. Receives Telegram messages and sends replies.
 from dotenv import load_dotenv
 import os
+import re
 from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from agent import agent_brain
+
+TAG = re.compile(r"<[^>]+>")
 
 load_dotenv()
 
@@ -46,12 +51,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = "The agent returned an empty response."
 
     sections = _telegram_sections(response)
-    await reply.edit_text(sections[0])
+    await _send(reply.edit_text, sections[0])
 
     # Extra completed sections are sent only after the model has finished, so
     # long responses are preserved without reintroducing incremental streaming.
     for section in sections[1:]:
-        await update.message.reply_text(section)
+        await _send(update.message.reply_text, section)
+
+
+async def _send(send, text: str) -> None:
+    """Send as HTML, falling back to plain text rather than losing the message.
+
+    Replies are composed as Telegram HTML so bold renders instead of the user seeing
+    literal markup. If a stray tag ever makes Telegram reject the message, the content
+    still has to arrive, so it is retried with the tags stripped.
+    """
+    try:
+        await send(text, parse_mode=ParseMode.HTML)
+    except BadRequest as error:
+        print(f"[TELEGRAM] HTML rejected ({error}); sending as plain text")
+        await send(TAG.sub("", text))
 
 
 def main():

@@ -7,7 +7,7 @@ Status values: **OPEN** · **FIXED** (with commit) · **WONTFIX** (with reason)
 
 ---
 
-## DESIGN-001 — Deciding what a message is about — **PROPOSED, not implemented**
+## DESIGN-001 — Deciding what a message is about — **IMPLEMENTED as a numbered menu**
 
 Requested: a reliable way to tell a new search, a new purchase, an addition to the
 cart, and a reply about what is already on screen apart from one another.
@@ -72,7 +72,7 @@ model named) short-circuits to add-and-confirm. Collapse `checkout`+`confirm` in
 approval for single-item lists, keeping the two-step gate only when the list has
 several items or exceeds a value threshold. The order refusal itself does not change.
 
-### ISSUE-009 — Result formatting is dense and shows noise — **OPEN**
+### ISSUE-009 — Result formatting is dense and shows noise — **FIXED**
 
 **Seen:**
 
@@ -90,7 +90,7 @@ short bolded name line and a compact facts line with price, unit price, and arri
 only. Trim residual filler phrases from titles. Keep the whole message no longer than
 the current longest reply — a table is acceptable only if it does not add height.
 
-### ISSUE-010 — Raw markdown is shown to the user — **OPEN**
+### ISSUE-010 — Raw markdown is shown to the user — **FIXED**
 
 **Seen:** `**Pick one:**` appears literally in Telegram.
 
@@ -102,7 +102,7 @@ the user, since product titles can contain characters that would otherwise break
 parsing. Then bold is genuinely bold and no markup is visible. This also delivers the
 bolded headers asked for in ISSUE-009.
 
-### ISSUE-011 — "i prefer the runner up" started a new search — **OPEN, highest priority**
+### ISSUE-011 — "i prefer the runner up" started a new search — **FIXED**
 
 **Seen:** after a recommendation with a named runner-up, replying `i prefer the runner
 up` searched Amazon for "i prefer the runner up" and returned marathon t-shirts.
@@ -124,7 +124,7 @@ conservative — a reply arriving immediately after a recommendation should be r
 against the presented options first, and only become a search when it clearly names a
 product that is not on screen. Regression tests will cover the exact transcript.
 
-### ISSUE-012 — Refining re-filters instead of searching again — **OPEN**
+### ISSUE-012 — Refining re-filters instead of searching again — **FIXED**
 
 **Seen:** `under $16` narrowed the existing five results to two, one of which was
 irrelevant, rather than finding five options under $16.
@@ -176,7 +176,7 @@ budget to 15s and navigate on `domcontentloaded`.
 **Verified live** across `iphone case`, `AA batteries`, `head and shoulders shampoo`,
 `organic body wash`, `jockey white t shirts medium` — 5 results each.
 
-### ISSUE-002 — A bare word "search" triggered developer usage text — **OPEN**
+### ISSUE-002 — A bare word "search" triggered developer usage text — **FIXED**
 
 **Seen:** typing `search` returned `Search usage: search: <query>.`
 
@@ -263,3 +263,59 @@ consider reading the price from the product page when a candidate is selected.
 
 Record the transcript verbatim, then what you expected. Root cause can be filled in
 later — an accurate observation is worth more than a guess at the cause.
+
+
+---
+
+## UAT session 3 — 2026-07-30, "employee" and the redesign
+
+### ISSUE-013 — Typing a suggested brand added a random product — **FIXED**
+
+**Seen:** the hint offered `a brand, like "Employee"` under *Narrow it*. Typing
+`employee` selected a product and added it to the list.
+
+**Root cause:** the same free text meant two different things. Brand words were routed
+to the resolver, which selects; the hint promised they would filter. There was no way
+for the agent to tell the two intents apart, because the user's words genuinely did not
+distinguish them.
+
+**Fix:** replaced by the numbered menu. Narrowing is now an explicit choice, and
+choosing a product is a number. The same input can no longer mean two things.
+
+### ISSUE-014 — The list was mistaken for search results — **FIXED**
+
+**Seen:** after adding an item, the reply showed the list including coffee filters from
+earlier in the conversation. The user read those as new suggestions.
+
+**Root cause:** results and the list rendered identically. Nothing distinguished "what
+Amazon returned" from "what you have chosen".
+
+**Fix:** results are headed 🔎 *Results for X*; the list is headed 🧺 *Your list*, with
+a subtotal and the not-in-your-Amazon-cart notice. A regression test asserts the two
+never look alike.
+
+### ISSUE-015 — Confirming twice pushed to the Amazon cart twice — **FIXED**
+
+**Found while testing the redesign, not reported.** After confirming, the checkout menu
+stayed pending, so replying "1" again re-ran the confirm and pushed the same items to
+the real Amazon cart a second time. The menu is now replaced on confirm, and a test
+asserts only one push happens.
+
+### ISSUE-016 — First search after startup could time out — **FIXED**
+
+**Seen live:** `order coffee filters` failed, then an immediate repeat succeeded.
+
+**Root cause:** the first search pays browser cold-start cost and exceeded the budget.
+
+**Fix:** one automatic retry before reporting failure. A retry only re-reads a public
+results page, so it changes nothing. Verified live: "iphone case" failed attempt 1 and
+succeeded on attempt 2 without the user seeing an error.
+
+### ISSUE-017 — Removing an item only removes it locally — **OPEN**
+
+**Not user-reported; found during the dead-code sweep.** If the user confirms (which
+pushes to the real Amazon cart) and then removes an item from the list, Amazon still
+has it. `amazon.remove_from_cart()` exists and is live-verified but nothing calls it.
+
+**Plan:** after a confirmed push, removing an item should also remove it from the real
+Amazon cart, or say plainly that it will not.

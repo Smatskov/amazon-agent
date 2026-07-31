@@ -6,6 +6,8 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from menu import MenuOption
+
 
 class WorkflowState(StrEnum):
     IDLE = "idle"
@@ -90,6 +92,9 @@ class PurchaseWorkflow:
     pending_question: str | None = None
     candidates: list[Candidate] = field(default_factory=list)
     selected_candidate_id: str | None = None
+    # The numbered choices last shown. Persisted so the number the user sees is the
+    # number the agent resolves against, even across a restart.
+    pending_menu: list[MenuOption] = field(default_factory=list)
     cart: list[CartLine] = field(default_factory=list)
     # Identifies the exact order contents the user last confirmed. Any change to the
     # cart produces a different token, which invalidates the confirmation (ADR-026).
@@ -124,11 +129,6 @@ class PurchaseWorkflow:
             None,
         )
 
-    def to_record(self) -> dict[str, Any]:
-        record = asdict(self)
-        record["state"] = self.state.value
-        return record
-
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "PurchaseWorkflow":
         data = _known_fields(cls, record)
@@ -140,4 +140,15 @@ class PurchaseWorkflow:
         data["cart"] = [
             CartLine(**_known_fields(CartLine, line)) for line in record.get("cart") or []
         ]
+        data["pending_menu"] = [
+            MenuOption.from_record(option)
+            for option in record.get("pending_menu") or []
+            if isinstance(option, dict) and "action" in option
+        ]
         return cls(**data)
+
+    def to_record(self) -> dict[str, Any]:
+        record = asdict(self)
+        record["state"] = self.state.value
+        record["pending_menu"] = [option.to_record() for option in self.pending_menu]
+        return record

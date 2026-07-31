@@ -1,51 +1,67 @@
-"""Turn stored candidates into concise, fact-preserving Telegram text.
+"""Turn stored facts into Telegram messages.
+
+Output is Telegram HTML: the previous version emitted markdown asterisks that Telegram
+sent verbatim, so the user saw literal `**Pick one:**`. Every value that came from
+Amazon or the user is escaped, because a product title can contain characters that
+would otherwise break the message.
 
 Presentation is separated from orchestration so message shape can change without
-touching workflow decisions. Every value shown here comes from a stored candidate:
-this module shortens and arranges facts, and never adds one.
+touching workflow decisions. This module shortens and arranges facts; it never adds
+one, and it never invents a value that Amazon did not supply.
 """
 
+from html import escape
 import re
 
+import menu
 import ranking
+from menu import MenuOption
 from ranking import RankedCandidates
 from workflow_models import Candidate, CartLine
 
 
 # Marketing detail is usually appended after a comma, a spaced dash, or a bracket.
 SEGMENT_SPLIT = re.compile(r"\s*[,|;]\s*|\s+[-–—]\s+|\s*[()\[\]]\s*")
-TITLE_WORD_LIMIT = 12
-TOTAL_WORD_BUDGET = 16
-# Variant facts are terse ("White", "Medium", "3 Pack", "4 Ounces"); marketing copy
-# runs long ("to Reinforce and Protect Enamel"). Length separates them well enough.
+TITLE_WORD_LIMIT = 10
+TOTAL_WORD_BUDGET = 14
 VARIANT_SEGMENT_WORD_LIMIT = 3
-PREVIEW_DISCLAIMER = "These are search results, not a recommendation or a purchase."
-# The basket lives in this agent's database, not in the user's Amazon account. Saying
-# so on every cart message prevents the most damaging possible misunderstanding.
-NOT_IN_AMAZON_CART = (
-    "This list is held by me only — nothing has been added to your Amazon cart, "
-    "and no order can be placed."
+# Phrases that carry no information for a shopper choosing between options.
+FILLER_PHRASES = re.compile(
+    r"\b(?:packaging may vary|may vary|new version|frustration[- ]free packaging|"
+    r"amazon exclusive|packaging varies)\b",
+    re.IGNORECASE,
 )
+NOT_IN_AMAZON_CART = (
+    "Held by me only — nothing is in your Amazon cart yet, and I can't place orders."
+)
+
+
+def text(value: str | None) -> str:
+    """Escape anything that came from Amazon or the user."""
+    return escape(value or "", quote=False)
 
 
 def display_title(raw: str, *, word_limit: int = TITLE_WORD_LIMIT) -> str:
     """Shorten a raw Amazon title while keeping the facts that identify the variant.
 
-    Colour, size, and pack count are what distinguish two otherwise identical
-    listings, so they are preserved ahead of marketing copy even though they appear
-    later in the title.
+    Colour, size, and pack count distinguish otherwise identical listings, so they are
+    preserved ahead of marketing copy even though they appear later in the title.
     """
-    segments = [segment.strip() for segment in SEGMENT_SPLIT.split(raw) if segment and segment.strip()]
+    cleaned = FILLER_PHRASES.sub("", raw or "")
+    segments = [
+        segment.strip()
+        for segment in SEGMENT_SPLIT.split(cleaned)
+        if segment and segment.strip()
+    ]
     if not segments:
-        return raw.strip()
+        return (raw or "").strip()
 
     head = _trim(segments[0], word_limit)
     if ranking.pack_count(head):
         return head
 
     variants = [
-        segment
-        for segment in segments[1:]
+        segment for segment in segments[1:]
         if len(segment.split()) <= VARIANT_SEGMENT_WORD_LIMIT
     ]
     pack_segment = next((segment for segment in variants if ranking.pack_count(segment)), None)
@@ -62,194 +78,124 @@ def display_title(raw: str, *, word_limit: int = TITLE_WORD_LIMIT) -> str:
         used += length
     if pack_segment:
         kept.append(pack_segment)
-
     return ", ".join([head, *kept]) if kept else head
 
 
 def candidate_facts(candidate: Candidate) -> str:
-    """One line of only the facts Amazon actually showed for this candidate."""
+    """A short facts line: price, unit price, arrival.
+
+    Review counts are deliberately absent. They drive the ranking, but printing
+    "(24,037 reviews)" beside every option is noise once the user trusts the ordering.
+    """
     facts = [candidate.price_text or "price not shown"]
     unit = ranking.unit_price(candidate)
-    if unit is not None:
-        facts.append(f"${unit:.2f} each")
-    if candidate.rating is not None:
-        rating = f"{candidate.rating:g}/5"
-        if candidate.review_count is not None:
-            rating += f" ({candidate.review_count:,} reviews)"
-        facts.append(rating)
+    if unit is not None and (candidate.price or 0) != unit:
+        facts.append(f"{unit:.2f} each".replace("0.", "$0.") if unit < 1 else f"${unit:.2f} each")
     if candidate.delivery_label:
         facts.append(f"arrives {candidate.delivery_label}")
-    if candidate.prime_eligible:
-        facts.append("Prime")
-    return " — ".join(facts)
+    return " · ".join(text(fact) for fact in facts)
 
 
-def next_step_hint(candidates: list[Candidate]) -> str:
-    """Say what to type, using this list's own facts as the examples.
-
-    The previous line offered "cheapest" and "highest rated", which read as jargon and
-    gave no way to narrow the search. Concrete examples drawn from the results are
-    easier to act on: a brand that is actually present, a price the results straddle.
-    """
-    if not candidates:
-        return 'Search for something, or say "cancel".'
-
-    lines = [
-        f"**Pick one:** reply {'1' if len(candidates) == 1 else f'1–{len(candidates)}'} "
-        "to add it to your list."
-    ]
-
-    narrow = []
-    # With a single result there is nothing to narrow, so only offer a fresh search.
-    if len(candidates) > 1:
-        brand = _example_brand(candidates)
-        if brand:
-            narrow.append(f'a brand, like "{brand}"')
-        budget = _example_budget(candidates)
-        if budget:
-            narrow.append(f'a budget, like "under ${budget}"')
-    narrow.append("or just name what you want instead")
-    lines.append(f"**Narrow it:** type {_sentence_list_plain(narrow)}.")
-
-    lines.append('**Or:** "cancel" to stop.')
-    return "\n".join(lines)
+def candidate_line(number: int, candidate: Candidate) -> str:
+    return (
+        f"{number} · <b>{text(display_title(candidate.title))}</b>\n"
+        f"    {candidate_facts(candidate)}"
+    )
 
 
-def _example_brand(candidates: list[Candidate]) -> str | None:
-    """Use a brand that is genuinely in these results, so the example always works."""
-    for candidate in candidates:
-        first = candidate.title.split()
-        if first and first[0].isalpha() and len(first[0]) > 2:
-            return first[0]
-    return None
-
-
-def _example_budget(candidates: list[Candidate]) -> str | None:
-    """Suggest a threshold that would actually exclude something."""
-    prices = sorted(c.price for c in candidates if c.price is not None)
-    if len(prices) < 2 or prices[0] == prices[-1]:
-        return None
-    middle = prices[len(prices) // 2]
-    return f"{int(middle)}" if middle >= 2 else None
-
-
-def _sentence_list_plain(items: list[str]) -> str:
-    if len(items) == 1:
-        return items[0]
-    return f"{', '.join(items[:-1])}, {items[-1]}"
-
-
-def present_candidates(
+def present_results(
     goal: str,
     ranked: RankedCandidates,
+    options: list[MenuOption],
     *,
     removed: int = 0,
-    removal_reasons: tuple[str, ...] = (),
     refined: bool = False,
 ) -> str:
-    """Build the complete candidate message, spaced so it is readable on a phone."""
+    """Search results, always visually distinct from the user's own list."""
     candidates = ranked.candidates
     if not candidates:
-        return f'I could not find any Amazon results for "{goal}" that met your requirements.'
+        return f"No results for <b>{text(goal)}</b> that met your requirements."
 
-    blocks = [_header(goal, ranked, refined)]
-    for index, candidate in enumerate(candidates, start=1):
-        blocks.append(f"{index}. {display_title(candidate.title)}\n{candidate_facts(candidate)}")
+    lead = "Narrowed to" if refined else "Results for"
+    blocks = [f"🔎 <b>{lead} {text(goal)}</b>"]
+    blocks.append("\n\n".join(candidate_line(i, c) for i, c in enumerate(candidates, 1)))
 
     notes = []
     if removed:
-        reasons = f" ({_sentence_list(list(removal_reasons))})" if removal_reasons else ""
-        notes.append(f"I left out {removed} result{_plural(removed)}{reasons}.")
+        notes.append(f"{removed} result{_plural(removed)} left out.")
     if ranked.caveat:
-        notes.append(ranked.caveat)
+        notes.append(text(ranked.caveat))
     if notes:
-        blocks.append(" ".join(notes))
+        blocks.append(f"<i>{' '.join(notes)}</i>")
 
-    blocks.append(f"{PREVIEW_DISCLAIMER}\n{next_step_hint(candidates)}")
-    return "\n\n".join(blocks)
+    blocks.append(menu.render(options, start=len(candidates) + 1, heading="Or:"))
+    return "\n\n".join(block for block in blocks if block)
 
 
-def present_recommendation(goal: str, recommendation, total_found: int) -> str:
-    """Name one pick and why, and ask before adding anything."""
+def present_recommendation(
+    goal: str, recommendation, total_found: int, options: list[MenuOption]
+) -> str:
+    """One pick with the evidence for it, and the choices that follow."""
     candidate = recommendation.candidate
-    reasons = "; ".join(recommendation.reasons)
     blocks = [
-        f'For "{goal}" I\'d pick this out of {total_found} result'
-        f'{_plural(total_found)}:',
-        f"{display_title(candidate.title)}\n{candidate_facts(candidate)}",
-        f"Why: {reasons}.",
+        f"🛒 <b>Best match for {text(goal)}</b>",
+        f"<b>{text(display_title(candidate.title))}</b>\n{candidate_facts(candidate)}",
+        f"<i>{text('; '.join(recommendation.reasons))}</i>",
     ]
-    if recommendation.runner_up is not None:
-        blocks.append(
-            f"Runner-up: {display_title(recommendation.runner_up.title)} — "
-            f"{candidate_facts(recommendation.runner_up)}"
-        )
-    blocks.append(
-        'Reply "yes" to add it to your list, "options" to see everything I found, '
-        'or name something else.'
-    )
+    if total_found > 1:
+        blocks.append(f"<i>Chosen from {total_found} results.</i>")
+    blocks.append(menu.render(options, heading="What next?"))
     return "\n\n".join(blocks)
 
 
-def present_cart(lines: list[CartLine], subtotal: float | None) -> str:
-    """Show the preview basket, always stating that Amazon has not been touched."""
+def present_cart(lines: list[CartLine], subtotal: float | None, options: list[MenuOption]) -> str:
+    """The user's own list, clearly not a set of search results."""
     if not lines:
-        return "Your list is empty. Search for something and pick an option to add it."
+        return "🧺 <b>Your list is empty.</b>\n\nTell me what to look for."
 
-    blocks = [f"Your list ({sum(line.quantity for line in lines)} item{_plural(sum(line.quantity for line in lines))}):"]
-    for index, line in enumerate(lines, start=1):
-        blocks.append(f"{index}. {display_title(line.title)}\n{_line_facts(line)}")
+    count = sum(line.quantity for line in lines)
+    blocks = [f"🧺 <b>Your list</b> — {count} item{_plural(count)}"]
+    blocks.append("\n".join(_cart_line(i, line) for i, line in enumerate(lines, 1)))
     blocks.append(_subtotal_line(subtotal))
-    blocks.append(NOT_IN_AMAZON_CART)
-    return "\n\n".join(blocks)
+    blocks.append(f"<i>{NOT_IN_AMAZON_CART}</i>")
+    blocks.append(menu.render(options, heading="What next?"))
+    return "\n\n".join(block for block in blocks if block)
 
 
-def present_checkout(summary) -> str:
-    """The exact contents the user is being asked to approve."""
+def present_checkout(summary, options: list[MenuOption]) -> str:
+    """Exactly what the user is being asked to approve."""
     if summary.is_empty:
-        return "There is nothing to check out. Your list is empty."
+        return "Nothing to check out — your list is empty."
 
-    blocks = ["Order summary — please review before confirming."]
-    for index, line in enumerate(summary.lines, start=1):
-        blocks.append(f"{index}. {display_title(line.title)}\n{_line_facts(line)}")
+    blocks = ["📋 <b>Order summary</b>"]
+    blocks.append("\n".join(_cart_line(i, line) for i, line in enumerate(summary.lines, 1)))
     blocks.append(_subtotal_line(summary.subtotal))
     blocks.append(
-        "Not included, because Amazon has not supplied them: "
-        f"{_sentence_list(list(summary.unknown))}. The real total will be higher."
+        f"<i>Excludes {text(_sentence_list(list(summary.unknown)))}. "
+        "The real total will be higher.</i>"
     )
-    blocks.append(
-        f"{NOT_IN_AMAZON_CART}\n"
-        "Reply \"confirm\" to approve this summary, or \"cancel\" to stop."
-    )
+    blocks.append(menu.render(options, heading="What next?"))
     return "\n\n".join(blocks)
 
 
-def _line_facts(line: CartLine) -> str:
-    facts = [f"Qty {line.quantity}", line.price_text or "price not shown"]
+def _cart_line(number: int, line: CartLine) -> str:
+    facts = [line.price_text or "price not shown"]
+    if line.quantity > 1:
+        facts.insert(0, f"×{line.quantity}")
     if line.line_total is not None and line.quantity > 1:
-        facts.append(f"line total ${line.line_total:.2f}")
-    return " — ".join(facts)
+        facts.append(f"= ${line.line_total:.2f}")
+    return f"{number} · <b>{text(display_title(line.title))}</b>\n    {text(' · '.join(facts))}"
 
 
 def _subtotal_line(subtotal: float | None) -> str:
     if subtotal is None:
-        return "Subtotal: not available, because at least one item did not show a price."
-    return f"Subtotal: ${subtotal:.2f} (items only)"
+        return "<b>Subtotal:</b> unavailable — an item showed no price."
+    return f"<b>Subtotal:</b> ${subtotal:.2f} <i>(items only)</i>"
 
 
-def _header(goal: str, ranked: RankedCandidates, refined: bool) -> str:
-    count = len(ranked.candidates)
-    # A refinement reuses results already retrieved, so it must not claim a new search.
-    lead = "Narrowed to" if refined else "I found"
-    found = f'{lead} {count} Amazon result{_plural(count)} for "{goal}"'
-    if ranked.basis in ranking.POSITIONAL_BASES:
-        return f"{found}, in {ranked.basis}."
-    return f"{found}, ordered by {ranked.basis}."
-
-
-def _trim(text: str, word_limit: int) -> str:
-    words = text.split()
-    return text.strip() if len(words) <= word_limit else " ".join(words[:word_limit]) + "…"
+def _trim(value: str, word_limit: int) -> str:
+    words = value.split()
+    return value.strip() if len(words) <= word_limit else " ".join(words[:word_limit]) + "…"
 
 
 def _plural(count: int) -> str:
@@ -257,6 +203,8 @@ def _plural(count: int) -> str:
 
 
 def _sentence_list(items: list[str]) -> str:
+    if not items:
+        return ""
     if len(items) == 1:
         return items[0]
-    return f"{', '.join(items[:-1])}, or {items[-1]}"
+    return f"{', '.join(items[:-1])}, and {items[-1]}"

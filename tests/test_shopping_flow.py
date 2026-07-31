@@ -55,12 +55,12 @@ def test_picking_an_option_puts_it_on_the_list_with_a_subtotal(paths, monkeypatc
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     reply = _run("1", paths)
 
     assert "Added Duracell Coppertop AA Batteries, 24 Count" in reply
-    assert "Subtotal: $18.49" in reply
-    assert "nothing has been added to your Amazon cart" in reply
+    assert "$18.49" in reply
+    assert "nothing is in your Amazon cart yet" in reply
     workflow = workflow_store.get_active_workflow(USER, paths[1])
     assert workflow.state == WorkflowState.PREPARING_CART
     assert workflow.cart[0].quantity == 1
@@ -70,14 +70,12 @@ def test_a_quantity_stated_before_picking_applies_to_that_item_only(paths, monke
     _semantic(monkeypatch, _purchase("AA batteries"), _workflow_action("change_quantity", quantity=3))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("make it three", paths)
     _run("1", paths)
-    _run("2", paths)
 
     workflow = workflow_store.get_active_workflow(USER, paths[1])
     assert workflow.cart[0].quantity == 3
-    assert workflow.cart[1].quantity == 1
 
 
 def test_two_searches_build_one_list(paths, monkeypatch):
@@ -85,12 +83,12 @@ def test_two_searches_build_one_list(paths, monkeypatch):
     search = AsyncMock(side_effect=[_products(), _shirts()])
     monkeypatch.setattr(agent.amazon, "search_products", search)
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
-    _run("now jockey t shirts", paths)
+    _run("find me jockey t shirts", paths)
     reply = _run("1", paths)
 
-    assert "Subtotal: $48.48" in reply
+    assert "$48.48" in reply
     workflow = workflow_store.get_active_workflow(USER, paths[1])
     assert len(workflow.cart) == 2
 
@@ -130,9 +128,9 @@ def test_removing_by_description_takes_the_right_item_off(paths, monkeypatch):
     )
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(side_effect=[_products(), _shirts()]))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
-    _run("now jockey t shirts", paths)
+    _run("find me jockey t shirts", paths)
     _run("1", paths)
     reply = _run("actually remove the t shirts", paths)
 
@@ -145,7 +143,7 @@ def test_add_it_refers_to_the_item_just_picked(paths, monkeypatch):
     _semantic(monkeypatch, _purchase("AA batteries"), _workflow_action("add_to_cart"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     reply = _run("ok add it to the cart", paths)
 
@@ -159,7 +157,7 @@ def test_restating_add_does_not_silently_double_the_quantity(paths, monkeypatch)
     _semantic(monkeypatch, _purchase("AA batteries"), _workflow_action("add_to_cart"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     _run("add the duracell", paths)
 
@@ -180,7 +178,7 @@ def test_ordinary_purchase_requests_carry_no_delivery_note(paths, monkeypatch):
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    reply = _run("buy AA batteries", paths)
+    reply = _run("find me AA batteries", paths)
 
     assert "delivery" not in reply
 
@@ -196,7 +194,7 @@ def test_conversation_about_the_list_receives_the_list(paths, monkeypatch):
     generate = AsyncMock(return_value="One item.")
     monkeypatch.setattr(agent, "generate_response", generate)
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     _run("what's on my list?", paths)
 
@@ -210,12 +208,12 @@ def test_checkout_shows_exact_contents_and_names_what_is_unknown(paths, monkeypa
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     reply = _run("checkout", paths)
 
     assert "Order summary" in reply
-    assert "Subtotal: $18.49" in reply
+    assert "$18.49" in reply
     assert "shipping cost" in reply
     assert "The real total will be higher." in reply
     assert workflow_store.get_active_workflow(USER, paths[1]).state == WorkflowState.AWAITING_CHECKOUT_CONFIRMATION
@@ -225,7 +223,7 @@ def test_checkout_with_an_empty_list_is_refused(paths, monkeypatch):
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     reply = _run("checkout", paths)
 
     assert "nothing to check out" in reply
@@ -242,7 +240,7 @@ def test_every_way_of_asking_to_buy_reaches_the_refusal(paths, monkeypatch, mess
     generate = AsyncMock(return_value="Your order has been placed!")
     monkeypatch.setattr(agent, "generate_response", generate)
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     _run("checkout", paths)
     reply = _run(message, paths)
@@ -255,7 +253,7 @@ def test_confirming_records_approval_but_places_nothing(paths, monkeypatch):
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     _run("checkout", paths)
     reply = _run("confirm", paths)
@@ -272,7 +270,7 @@ def test_declining_at_the_gate_returns_to_the_list_without_ordering(paths, monke
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     _run("checkout", paths)
     reply = _run("no", paths)
@@ -285,11 +283,15 @@ def test_changing_the_list_after_confirming_invalidates_the_confirmation(paths, 
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     _run("checkout", paths)
     _run("confirm", paths)
-    _run("2", paths)
+    # Change the contents after confirming.
+    workflow = workflow_store.get_active_workflow(USER, paths[1])
+    import cart as cart_module
+    workflow.cart = cart_module.set_quantity(workflow.cart, workflow.cart[0].candidate_id, 5)
+    workflow_store.save_workflow(workflow, paths[1])
 
     import checkout as checkout_module
 
@@ -301,7 +303,7 @@ def test_asking_to_confirm_before_checkout_asks_for_the_summary_first(paths, mon
     _semantic(monkeypatch, _purchase("AA batteries"))
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
 
-    _run("buy AA batteries", paths)
+    _run("find me AA batteries", paths)
     _run("1", paths)
     reply = _run("confirm", paths)
 

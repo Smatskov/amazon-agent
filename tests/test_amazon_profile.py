@@ -259,3 +259,50 @@ def test_result_timeouts_allow_for_heavy_pages():
     """A phone-case results page is ~1.5 MB and exceeded the old 6s budget."""
     assert amazon.BROWSER_RESULTS_TIMEOUT_MS >= 12_000
     assert amazon.BROWSER_NAVIGATION_TIMEOUT_MS >= 20_000
+
+
+def test_a_transient_search_failure_is_retried_once(monkeypatch):
+    """The first search after browser start was seen timing out where a repeat worked."""
+    attempts = {"count": 0}
+
+    class Context:
+        pass
+
+    class Manager:
+        async def __aenter__(self):
+            return Context()
+
+        async def __aexit__(self, *args):
+            return None
+
+    async def flaky(context, query):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise amazon.AmazonSearchUnavailable("timeout")
+        return [amazon.Product("Thing", "$1.00", "https://www.amazon.com/dp/x")]
+
+    monkeypatch.setattr(amazon, "_persistent_browser_context", lambda **kw: Manager())
+    monkeypatch.setattr(amazon, "_search_in_context", flaky)
+
+    products = asyncio.run(amazon.search_products("thing"))
+
+    assert attempts["count"] == 2
+    assert len(products) == 1
+
+
+def test_a_persistent_search_failure_still_raises(monkeypatch):
+    class Manager:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *args):
+            return None
+
+    async def always_fails(context, query):
+        raise amazon.AmazonSearchUnavailable("interstitial")
+
+    monkeypatch.setattr(amazon, "_persistent_browser_context", lambda **kw: Manager())
+    monkeypatch.setattr(amazon, "_search_in_context", always_fails)
+
+    with pytest.raises(amazon.AmazonSearchUnavailable):
+        asyncio.run(amazon.search_products("thing"))

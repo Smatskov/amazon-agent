@@ -404,7 +404,7 @@ def test_display_title_never_raises_and_never_empty(title):
 def test_presentation_scales(count):
     candidates = [_candidate(i, f"Product {i}", price=float(i + 1)) for i in range(count)]
     ranked = ranking.rank(candidates, SortPreference.PRICE)
-    message = product_display.present_candidates("things", ranked)
+    message = product_display.present_results("things", ranked, [])
     assert isinstance(message, str) and message.strip()
     for section in main._telegram_sections(message):
         assert len(section) <= main.TELEGRAM_MESSAGE_LIMIT
@@ -415,10 +415,10 @@ def test_cart_presentation_scales(lines):
     basket = []
     for index in range(lines):
         basket = cart_module.add(basket, _candidate(index, f"Item {index}", price=1.0 + index))
-    message = product_display.present_cart(basket, cart_module.subtotal(basket))
+    message = product_display.present_cart(basket, cart_module.subtotal(basket), [])
     assert message.strip()
     if lines:
-        assert product_display.NOT_IN_AMAZON_CART in message
+        assert "Amazon cart" in message
 
 
 # --- checkout gate edges (12 cases) -------------------------------------------

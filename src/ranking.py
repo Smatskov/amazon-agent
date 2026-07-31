@@ -27,8 +27,6 @@ RATING_REQUEST = re.compile(r"\b(?:highest|best|top)[- ]?(?:rated|reviewed|ratin
 
 AMAZON_ORDER = "Amazon's own result order"
 PREVIOUS_ORDER = "their previous order"
-# Bases that describe a position rather than a measure, for phrasing.
-POSITIONAL_BASES = frozenset({AMAZON_ORDER, PREVIOUS_ORDER})
 
 
 MONTHS = {

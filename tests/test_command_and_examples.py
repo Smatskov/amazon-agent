@@ -193,9 +193,9 @@ def test_a_command_recommends_one_and_waits_for_yes(tmp_path, monkeypatch):
 
     recommended = asyncio.run(agent.agent_brain("add head and shoulders shampoo to my cart", *paths, 31))
 
-    assert "I'd pick this" in recommended
+    assert "Best match" in recommended
     assert "Head and Shoulders" in recommended
-    assert "Why:" in recommended
+    assert "lowest price" in recommended or "matches" in recommended
     # Nothing is on the list until the user agrees.
     assert workflow_store.get_active_workflow(31, paths[1]).cart == []
 
@@ -218,8 +218,8 @@ def test_options_shows_the_full_list_after_a_recommendation(tmp_path, monkeypatc
     asyncio.run(agent.agent_brain("add shampoo to my cart", *paths, 32))
     listing = asyncio.run(agent.agent_brain("options", *paths, 32))
 
-    assert "1." in listing and "2." in listing
-    assert "Pick one" in listing
+    assert "1 ·" in listing and "2 ·" in listing
+    assert "1 ·" in listing
 
 
 def test_a_browse_request_still_shows_every_option(tmp_path, monkeypatch):
@@ -233,8 +233,8 @@ def test_a_browse_request_still_shows_every_option(tmp_path, monkeypatch):
 
     reply = asyncio.run(agent.agent_brain("find me shampoo", tmp_path / "m.db", tmp_path / "w.db", 33))
 
-    assert "I found 2 Amazon results" in reply
-    assert "I'd pick this" not in reply
+    assert "Results for" in reply
+    assert "Best match" not in reply
 
 
 def test_delivery_dates_reach_the_user(tmp_path, monkeypatch):

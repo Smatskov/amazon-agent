@@ -275,7 +275,7 @@ def test_a_transient_search_failure_is_retried_once(monkeypatch):
         async def __aexit__(self, *args):
             return None
 
-    async def flaky(context, query):
+    async def flaky(context, query, **kwargs):
         attempts["count"] += 1
         if attempts["count"] == 1:
             raise amazon.AmazonSearchUnavailable("timeout")
@@ -298,7 +298,7 @@ def test_a_persistent_search_failure_still_raises(monkeypatch):
         async def __aexit__(self, *args):
             return None
 
-    async def always_fails(context, query):
+    async def always_fails(context, query, **kwargs):
         raise amazon.AmazonSearchUnavailable("interstitial")
 
     monkeypatch.setattr(amazon, "_persistent_browser_context", lambda **kw: Manager())

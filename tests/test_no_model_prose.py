@@ -77,8 +77,9 @@ def test_a_whole_purchase_runs_without_the_model(tmp_path, monkeypatch):
     run("1")          # checkout
     done = run("1")   # confirm
 
-    assert "cannot place this order" in done
-    assert len(workflow_store.get_workflow(2, paths[1]).cart) == 1
+    assert "NO ORDER WAS PLACED" in done
+    # The demo order screen ends the session and empties the list.
+    assert workflow_store.get_workflow(2, paths[1]).cart == []
 
 
 def test_no_module_builds_a_reply_from_model_output():

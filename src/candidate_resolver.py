@@ -141,10 +141,24 @@ def _significant_tokens(text: str) -> set[str]:
     }
 
 
+# A reference points at something already on screen, so it is short: "the duracell",
+# "natrol gummies". A longer phrase is the user naming what they want, which is a
+# search. Matching those against stored results is what let "oral-B toothbrushes 6
+# pack" silently add a stale result instead of searching Amazon for it.
+MAX_REFERENCE_TOKENS = 3
+
+
 def _described_candidates(lower: str, candidates: list[Candidate]) -> list[Candidate]:
-    """Match candidates by the significant words the user actually typed."""
+    """Match candidates by the significant words the user actually typed.
+
+    Deliberately conservative in two ways. A message long enough to be a product
+    request is never read as a reference, and words that match every candidate equally
+    are treated as not discriminating rather than as an ambiguous reference — five
+    results all titled "Oral-B" should not turn "oral b toothpaste" into a question
+    about which one was meant.
+    """
     tokens = _significant_tokens(lower)
-    if not tokens:
+    if not tokens or len(tokens) > MAX_REFERENCE_TOKENS:
         return []
 
     scores = []
@@ -156,7 +170,13 @@ def _described_candidates(lower: str, candidates: list[Candidate]) -> list[Candi
         scores.append((len(tokens & words), candidate))
 
     best = max(score for score, _ in scores)
-    return [] if best == 0 else [candidate for score, candidate in scores if score == best]
+    if best == 0:
+        return []
+    matched = [candidate for score, candidate in scores if score == best]
+    # Every candidate fitting equally well means the words separate nothing.
+    if len(matched) == len(candidates) and len(candidates) > 1:
+        return []
+    return matched
 
 
 def _unique_extreme(candidates: list[Candidate], key, label: str) -> CandidateResolution:

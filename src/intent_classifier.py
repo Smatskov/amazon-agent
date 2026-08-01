@@ -21,7 +21,6 @@ MEMORY_ACTIONS = {"remember", "recall", "forget"}
 MIN_ACTION_CONFIDENCE = 0.65
 SEMANTIC_OUTPUT_TOKENS = 128
 # Memory phrasing must not hold up a reply. Shopping never waits on the model at all.
-MEMORY_TIMEOUT_SECONDS = 8.0
 
 
 @dataclass(frozen=True, slots=True)

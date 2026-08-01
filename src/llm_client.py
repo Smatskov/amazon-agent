@@ -4,11 +4,9 @@
 import os
 import json
 import logging
-from time import perf_counter
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from timing import RequestTiming
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +32,6 @@ async def generate_response(
     temperature: float = 0.3,
     json_mode: bool = False,
     system_prompt: str | None = None,
-    timing: RequestTiming | None = None,
 ) -> str:
     """Return the visible, completed response from the local language model."""
     # This module owns the OpenAI-compatible protocol. The rest of the application
@@ -50,61 +47,17 @@ async def generate_response(
     }
     if max_tokens is not None:
         request["max_tokens"] = max_tokens
-    if timing is None:
-        response = await client.chat.completions.create(**request)
+    response = await client.chat.completions.create(**request)
 
-        choice_message = response.choices[0].message
-        content = _structured_content(
-            choice_message.content,
-            getattr(choice_message, "reasoning_content", None),
-            json_mode=json_mode,
-            mode="plain_json_prompt" if json_mode else "text",
-            model=getattr(response, "model", None),
-            finish_reason=getattr(response.choices[0], "finish_reason", None),
-        )
-    else:
-        request["stream"] = True
-        timing.mark_http_request_start()
-        request_started_at = perf_counter()
-        stream = await client.chat.completions.create(**request)
-        timing.request_ms += (perf_counter() - request_started_at) * 1000
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        finish_reason = None
-        response_model = None
-        async for chunk in stream:
-            timing.mark_first_byte()
-            response_model = getattr(chunk, "model", response_model)
-            delta = chunk.choices[0].delta.content if chunk.choices else None
-            reasoning_delta = (
-                getattr(chunk.choices[0].delta, "reasoning_content", None)
-                if chunk.choices
-                else None
-            )
-            if delta or reasoning_delta:
-                # Some local reasoning models emit their first generated token in
-                # a separate field. It is timed but never exposed as user content.
-                timing.mark_first_token()
-            if delta:
-                content_parts.append(delta)
-            if reasoning_delta:
-                reasoning_parts.append(reasoning_delta)
-            if chunk.choices and chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
-        timing.mark_model_complete()
-        content = _structured_content(
-            "".join(content_parts),
-            "".join(reasoning_parts),
-            json_mode=json_mode,
-            mode="plain_json_prompt_stream" if json_mode else "text_stream",
-            model=response_model,
-            finish_reason=finish_reason,
-        )
-
-    if not content or not content.strip():
-        raise ValueError("The local model returned an empty response.")
-
-    return content.strip()
+    choice_message = response.choices[0].message
+    content = _structured_content(
+        choice_message.content,
+        getattr(choice_message, "reasoning_content", None),
+        json_mode=json_mode,
+        mode="plain_json_prompt" if json_mode else "text",
+        model=getattr(response, "model", None),
+        finish_reason=getattr(response.choices[0], "finish_reason", None),
+    )
 
 
 def _structured_content(

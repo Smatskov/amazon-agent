@@ -25,14 +25,36 @@ SEGMENT_SPLIT = re.compile(r"\s*[,|;]\s*|\s+[-–—]\s+|\s*[()\[\]]\s*")
 TITLE_WORD_LIMIT = 10
 TOTAL_WORD_BUDGET = 14
 VARIANT_SEGMENT_WORD_LIMIT = 3
+# A leading segment this short is a brand, not a product name. Amazon separates with
+# "|", so "Dollar Shave Club | Shave Gel 6.7 ounce (2 Pack) | ..." split into a brand
+# head and descriptive segments too long to keep — leaving five results all reading
+# "Dollar Shave Club, 2 Pack". The name keeps absorbing segments until it says what
+# the product actually is.
+MIN_NAME_WORDS = 4
+# A segment with no letters or digits carries no information: an Amazon title ending
+# in an ellipsis produced a displayed name ending ", ...".
+HAS_CONTENT = re.compile(r"[a-z0-9]", re.IGNORECASE)
 # Phrases that carry no information for a shopper choosing between options.
 FILLER_PHRASES = re.compile(
     r"\b(?:packaging may vary|may vary|new version|frustration[- ]free packaging|"
     r"amazon exclusive|packaging varies)\b",
     re.IGNORECASE,
 )
+# A size or count is what separates two listings of the same product, so it is kept
+# ahead of marketing copy even when it appears late in the title.
+SIZE_SEGMENT = re.compile(
+    r"\d[\d.,]*\s*(?:fl\s*oz|oz|ml|liters?|l|kg|g|lbs?|ct|count|packs?|pk|"
+    r"tablets?|gummies|capsules?|softgels?|sheets?|rolls?)\b",
+    re.IGNORECASE,
+)
+# Words that cannot end a shortened title without looking like damage.
+DANGLING_WORDS = frozenset(
+    "for with and the to in of a an by on at is or from your our plus".split()
+)
+# Deliberately says nothing about what else the Amazon cart contains: it claimed the
+# cart was empty while four unrelated items were sitting in it.
 NOT_IN_AMAZON_CART = (
-    "Held by me only — nothing is in your Amazon cart yet, and I can't place orders."
+    "This list is held here only — these items have not been sent to your Amazon cart yet."
 )
 
 
@@ -51,19 +73,33 @@ def display_title(raw: str, *, word_limit: int = TITLE_WORD_LIMIT) -> str:
     segments = [
         segment.strip()
         for segment in SEGMENT_SPLIT.split(cleaned)
-        if segment and segment.strip()
+        if segment and segment.strip() and HAS_CONTENT.search(segment)
     ]
     if not segments:
         return (raw or "").strip()
 
-    head = _trim(segments[0], word_limit)
-    if ranking.pack_count(head):
-        return head
+    # Absorb following segments while the name is still too short to identify the
+    # product, so a brand alone is never the whole displayed name.
+    name = [segments[0]]
+    used = len(segments[0].split())
+    index = 1
+    while index < len(segments) and used < MIN_NAME_WORDS:
+        name.append(segments[index])
+        used += len(segments[index].split())
+        index += 1
 
+    head = _trim(", ".join(name), word_limit)
     variants = [
-        segment for segment in segments[1:]
+        segment for segment in segments[index:]
         if len(segment.split()) <= VARIANT_SEGMENT_WORD_LIMIT
     ]
+    size_segment = next((segment for segment in variants if SIZE_SEGMENT.search(segment)), None)
+
+    if ranking.pack_count(head):
+        # The head already names the pack, but a size still separates two listings of
+        # the same pack: "Dove Body Wash 2-Pack" alone dropped "15.2 Oz Ea".
+        return f"{head}, {size_segment}" if size_segment else head
+
     pack_segment = next((segment for segment in variants if ranking.pack_count(segment)), None)
 
     kept: list[str] = []
@@ -82,25 +118,87 @@ def display_title(raw: str, *, word_limit: int = TITLE_WORD_LIMIT) -> str:
 
 
 def candidate_facts(candidate: Candidate) -> str:
-    """A short facts line: price, unit price, arrival.
+    """A short facts line: price, per-unit price, arrival.
 
     Review counts are deliberately absent. They drive the ranking, but printing
     "(24,037 reviews)" beside every option is noise once the user trusts the ordering.
+
+    The per-unit price is what makes sizes comparable — a $15.88 7oz bottle beside a
+    $25.55 twin pack tells the user nothing until both are stated per ounce. Amazon's
+    own figure is preferred; the pack-count division is a fallback.
     """
     facts = [candidate.price_text or "price not shown"]
-    unit = ranking.unit_price(candidate)
-    if unit is not None and (candidate.price or 0) != unit:
-        facts.append(f"{unit:.2f} each".replace("0.", "$0.") if unit < 1 else f"${unit:.2f} each")
+    facts.append(_pack_fact(candidate))
+    if candidate.unit_price_text:
+        facts.append(candidate.unit_price_text)
+    else:
+        unit = ranking.unit_price(candidate)
+        if unit is not None and (candidate.price or 0) != unit:
+            facts.append(f"{unit:.2f} each".replace("0.", "$0.") if unit < 1 else f"${unit:.2f} each")
     if candidate.delivery_label:
         facts.append(f"arrives {candidate.delivery_label}")
     return " · ".join(text(fact) for fact in facts)
 
 
-def candidate_line(number: int, candidate: Candidate) -> str:
+def _pack_fact(candidate: Candidate) -> str:
+    """Always say how many the price buys, including when Amazon did not say.
+
+    A deodorant listing that states no count can be a single stick or a twelve-pack,
+    and the product page can raise the quantity further. Printing nothing let the user
+    compare a price against an unknown quantity; "count not stated" is the honest
+    version and is the cue to check before adding.
+    """
+    count = ranking.pack_count(candidate.title)
+    if count:
+        return f"{count} in the pack"
+    if candidate.unit_price_text and "count" in candidate.unit_price_text.casefold():
+        return "count per Amazon's unit price"
+    return "⚠️ count not stated"
+
+
+def candidate_line(number: int, candidate: Candidate, *, note: str = "") -> str:
+    suffix = f"  <i>{text(note)}</i>" if note else ""
     return (
-        f"{number} · <b>{text(display_title(candidate.title))}</b>\n"
+        f"{number} · <b>{text(display_title(candidate.title))}</b>{suffix}\n"
         f"    {candidate_facts(candidate)}"
     )
+
+
+def _outlier_notes(candidates: list[Candidate]) -> dict[str, str]:
+    """Flag a result that costs far more per unit than the rest of the set.
+
+    A $15.88 medicated shampoo sitting among $6 bottles is not a mistake, but nothing
+    on the line explained why it cost three times as much. Comparing against the
+    median rather than the mean keeps one outlier from hiding another.
+    """
+    values = {}
+    for candidate in candidates:
+        unit = _comparable_unit(candidate)
+        if unit is not None:
+            values[candidate.candidate_id] = unit
+    if len(values) < 3:
+        return {}
+    ordered = sorted(values.values())
+    median = ordered[len(ordered) // 2]
+    if median <= 0:
+        return {}
+    return {
+        candidate_id: "· specialist or premium — costs well above the rest per unit"
+        for candidate_id, unit in values.items()
+        if unit >= median * 2
+    }
+
+
+def _comparable_unit(candidate: Candidate) -> float | None:
+    """A per-unit number for comparison, from Amazon's own text where it exists."""
+    if candidate.unit_price_text:
+        match = re.search(r"\$\s*([\d,]+\.?\d*)", candidate.unit_price_text)
+        if match:
+            try:
+                return float(match.group(1).replace(",", ""))
+            except ValueError:
+                return None
+    return ranking.unit_price(candidate)
 
 
 def present_results(
@@ -116,66 +214,38 @@ def present_results(
     if not candidates:
         return f"No results for <b>{text(goal)}</b> that met your requirements."
 
-    lead = "Narrowed to" if refined else "Results for"
-    blocks = [f"🔎 <b>{lead} {text(goal)}</b>"]
-    blocks.append("\n\n".join(candidate_line(i, c) for i, c in enumerate(candidates, 1)))
+    lead = "NARROWED TO" if refined else "RESULTS FOR"
+    blocks = [f"🔎 <b>{lead} {text(goal.upper())}</b>"]
+    outliers = _outlier_notes(candidates)
+    blocks.append("\n\n".join(
+        candidate_line(i, c, note=outliers.get(c.candidate_id, ""))
+        for i, c in enumerate(candidates, 1)
+    ))
 
-    notes = []
+    footnotes = []
     if removed:
-        notes.append(f"{removed} result{_plural(removed)} left out.")
+        footnotes.append(f"{removed} result{_plural(removed)} left out.")
     if ranked.caveat:
-        notes.append(text(ranked.caveat))
-    if notes:
-        blocks.append(f"<i>{' '.join(notes)}</i>")
+        footnotes.append(text(ranked.caveat))
+    if footnotes:
+        blocks.append(f"<i>{' '.join(footnotes)}</i>")
 
     blocks.append(menu.render(options, start=len(candidates) + 1, heading="Or:"))
     return "\n\n".join(block for block in blocks if block)
 
 
-def present_recommendation(
-    goal: str, recommendation, total_found: int, options: list[MenuOption]
-) -> str:
-    """One pick with the evidence for it, and the choices that follow."""
-    candidate = recommendation.candidate
-    blocks = [
-        f"🛒 <b>Best match for {text(goal)}</b>",
-        f"<b>{text(display_title(candidate.title))}</b>\n{candidate_facts(candidate)}",
-        f"<i>{text('; '.join(recommendation.reasons))}</i>",
-    ]
-    if total_found > 1:
-        blocks.append(f"<i>Chosen from {total_found} results.</i>")
-    blocks.append(menu.render(options, heading="What next?"))
-    return "\n\n".join(blocks)
-
-
 def present_cart(lines: list[CartLine], subtotal: float | None, options: list[MenuOption]) -> str:
     """The user's own list, clearly not a set of search results."""
     if not lines:
-        return "🧺 <b>Your list is empty.</b>\n\nTell me what to look for."
+        return "🧺 <b>YOUR LIST IS EMPTY</b>\n\nTell me what to look for."
 
     count = sum(line.quantity for line in lines)
-    blocks = [f"🧺 <b>Your list</b> — {count} item{_plural(count)}"]
+    blocks = [f"🧺 <b>YOUR LIST</b> — {count} item{_plural(count)}"]
     blocks.append("\n".join(_cart_line(i, line) for i, line in enumerate(lines, 1)))
     blocks.append(_subtotal_line(subtotal))
     blocks.append(f"<i>{NOT_IN_AMAZON_CART}</i>")
     blocks.append(menu.render(options, heading="What next?"))
     return "\n\n".join(block for block in blocks if block)
-
-
-def present_checkout(summary, options: list[MenuOption]) -> str:
-    """Exactly what the user is being asked to approve."""
-    if summary.is_empty:
-        return "Nothing to check out — your list is empty."
-
-    blocks = ["📋 <b>Order summary</b>"]
-    blocks.append("\n".join(_cart_line(i, line) for i, line in enumerate(summary.lines, 1)))
-    blocks.append(_subtotal_line(summary.subtotal))
-    blocks.append(
-        f"<i>Excludes {text(_sentence_list(list(summary.unknown)))}. "
-        "The real total will be higher.</i>"
-    )
-    blocks.append(menu.render(options, heading="What next?"))
-    return "\n\n".join(blocks)
 
 
 def _cart_line(number: int, line: CartLine) -> str:
@@ -194,8 +264,19 @@ def _subtotal_line(subtotal: float | None) -> str:
 
 
 def _trim(value: str, word_limit: int) -> str:
+    """Shorten to a word budget without ending on a word that leads nowhere.
+
+    Cutting at a fixed count produced "Dove Body Wash with Pump 3 Count Deep Moisture
+    for…", where the trailing "for" reads as though the name was damaged rather than
+    shortened.
+    """
     words = value.split()
-    return value.strip() if len(words) <= word_limit else " ".join(words[:word_limit]) + "…"
+    if len(words) <= word_limit:
+        return value.strip()
+    kept = words[:word_limit]
+    while kept and kept[-1].casefold().strip(",.;-") in DANGLING_WORDS:
+        kept.pop()
+    return " ".join(kept) + "…" if kept else " ".join(words[:word_limit]) + "…"
 
 
 def _plural(count: int) -> str:
@@ -208,3 +289,119 @@ def _sentence_list(items: list[str]) -> str:
     if len(items) == 1:
         return items[0]
     return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def _money(value: str | None) -> float | None:
+    if not value:
+        return None
+    match = re.search(r"\d[\d,]*(?:\.\d{1,2})?", value)
+    try:
+        return float(match.group().replace(",", "")) if match else None
+    except ValueError:
+        return None
+
+
+def _cart_blocks(amazon_cart: list) -> tuple[list[str], str, int]:
+    """Render the whole Amazon cart, separating what this conversation added.
+
+    Both totals matter and only one was ever shown. The order the user would place is
+    every line here, so the count and total come from the cart, not from the list.
+    """
+    if not amazon_cart:
+        return [], "", 0
+    mine = [row for row in amazon_cart if len(row) > 2 and row[2]]
+    theirs = [row for row in amazon_cart if not (len(row) > 2 and row[2])]
+    amounts = [_money(row[1]) for row in amazon_cart]
+    total = (
+        f"${sum(a for a in amounts if a is not None):.2f}"
+        if amounts and all(a is not None for a in amounts)
+        else "unknown — an item showed no price"
+    )
+
+    def lines(rows: list) -> str:
+        return "\n".join(
+            f"• <b>{text(display_title(row[0]))}</b>"
+            f"{'  ' + text(row[1]) if row[1] else ''}"
+            for row in rows
+        )
+
+    blocks = []
+    if mine:
+        blocks.append(f"🆕 <b>ADDED FROM YOUR LIST</b> — {len(mine)} item(s)\n{lines(mine)}")
+    if theirs:
+        blocks.append(
+            f"📦 <b>ALREADY IN YOUR CART</b> — {len(theirs)} item(s)\n"
+            f"<i>Not added here. These would be ordered too.</i>\n{lines(theirs)}"
+        )
+    return blocks, total, len(amazon_cart)
+
+
+def _destination_block(destination) -> str:
+    """Where it ships and what would pay, as Amazon reports them.
+
+    Both are read-only and both say so. The agent cannot change either: Amazon puts
+    the address book behind a fresh sign-in, and this application never authenticates
+    or touches payment details. Showing them without that caveat would imply a control
+    the user does not have here.
+    """
+    if not destination:
+        return ""
+    address = (destination[0] if len(destination) > 0 else None) or "could not read it"
+    card = (destination[1] if len(destination) > 1 else None) or "could not read it"
+    return (
+        "📍 <b>SHIPPING &amp; CARD</b>\n"
+        f"    <b>Ships to</b>  {text(address)}\n"
+        f"    <b>Pays with</b>  {text(card)}\n"
+        "    <i>Your Amazon defaults, shown read-only. Change them on Amazon before "
+        "ordering.</i>"
+    )
+
+
+def present_ready_to_order(
+    summary, transfer: str, options: list[MenuOption], amazon_cart: list | None = None,
+    destination=None,
+) -> str:
+    """The screen that stands in for Amazon's own review-your-order page."""
+    blocks, total, count = _cart_blocks(amazon_cart or [])
+    if not blocks:
+        subtotal = "unknown" if summary.subtotal is None else f"${summary.subtotal:.2f}"
+        blocks, total, count = [transfer], subtotal, summary.item_count
+
+    head = [f"🛒 <b>IN YOUR AMAZON CART</b> — {count} item(s), {total}"]
+    tail = [
+        _destination_block(destination),
+        f"<i>Excludes {text(_sentence_list(list(summary.unknown)))}. "
+        "The real total will be higher.</i>",
+        menu.render(options, heading="What next?"),
+    ]
+    return "\n\n".join(block for block in [*head, *blocks, *tail] if block)
+
+
+def present_order_placed(
+    summary, options: list[MenuOption], amazon_cart: list | None = None, destination=None
+) -> str:
+    """A stand-in for Amazon's confirmation page.
+
+    The banner is not decoration. This screen is deliberately shaped like the real
+    thing, so the one fact that makes it not the real thing has to be the first thing
+    read: no order exists, and nothing has been charged.
+
+    Every line in the cart is listed, not only the ones added here — an order would
+    have bought all of them.
+    """
+    blocks, total, count = _cart_blocks(amazon_cart or [])
+    if not blocks:
+        total = "unknown" if summary.subtotal is None else f"${summary.subtotal:.2f}"
+        count = summary.item_count
+        blocks = ["\n".join(_cart_line(i, line) for i, line in enumerate(summary.lines, 1))]
+
+    return "\n\n".join(block for block in [
+        "🚧 <b>DEMO SCREEN — NO ORDER WAS PLACED</b>\n"
+        "<i>Order placement is switched off. Nothing has been bought or charged. "
+        "Your items are still sitting in your Amazon cart.</i>",
+        f"✅ <b>THANK YOU, YOUR ORDER IS CONFIRMED</b> — {count} item(s)",
+        *blocks,
+        _destination_block(destination),
+        f"<b>Order total:</b> {total} <i>(items only)</i>",
+        menu.render(options, heading="What next?"),
+    ] if block)

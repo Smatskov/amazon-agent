@@ -8,6 +8,7 @@ from html.parser import HTMLParser
 import os
 from pathlib import Path
 import re
+from time import perf_counter
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlparse
 
 from playwright.async_api import Error as PlaywrightError
@@ -46,6 +47,8 @@ class Product:
     availability: str | None = None
     prime_eligible: bool | None = None
     delivery: str | None = None
+    unit_price: str | None = None
+    image_url: str | None = None
 
 
 class AmazonSearchUnavailable(RuntimeError):
@@ -194,6 +197,10 @@ DELIVERY_DATE = re.compile(
 # A "Join Prime" upsell means this account is not a Prime member, so a Prime badge
 # would be misleading rather than helpful.
 PRIME_UPSELL = re.compile(r"join prime", re.IGNORECASE)
+# Amazon's own per-unit price, e.g. "($2.27/fluid ounce)" or "($0.83/count)". Copied
+# verbatim rather than computed: dividing a price by a size read out of a title would
+# invent a fact, and Amazon already states the one that is correct for the listing.
+UNIT_PRICE_TEXT = re.compile(r"\(\s*(\$[\d,]+\.?\d*\s*/\s*[A-Za-z][A-Za-z ]{0,18}?)\s*\)")
 
 
 def _result_metadata_from_html(html: str) -> tuple[str | None, float | None, int | None, bool | None]:
@@ -224,6 +231,15 @@ def _result_metadata_from_html(html: str) -> tuple[str | None, float | None, int
 HTML_TAG = re.compile(r"<[^>]+>")
 
 
+def _unit_price_from_html(html: str) -> str | None:
+    """Read the per-unit price Amazon printed on the card, or None when it printed none."""
+    text = unescape(HTML_TAG.sub(" ", html))
+    match = UNIT_PRICE_TEXT.search(" ".join(text.split()))
+    if not match:
+        return None
+    return " ".join(match.group(1).split()).replace(" /", "/").replace("/ ", "/")
+
+
 def _delivery_from_html(html: str) -> str | None:
     """Return a delivery date only when Amazon states one on the card.
 
@@ -235,19 +251,40 @@ def _delivery_from_html(html: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-async def _best_title(card, link) -> str | None:
-    """Pick the fuller of the heading and the link text.
+def _clean_title(value: str | None) -> str | None:
+    """Collapse whitespace and drop undecodable characters Amazon sometimes serves.
 
-    Layouts disagree about which one holds the product name: for a phone-case search
-    the heading has it and the anchor is empty, while for a shampoo search the heading
-    is only the brand ("Head & Shoulders") and the anchor has the full title.
+    A raw U+FFFD in a title ("Oral-B Cavity Defense 123 Black Toothbrush <?> Medium")
+    is not a product fact; it is a decoding artefact, so it is replaced with a dash.
+    """
+    if not value:
+        return None
+    cleaned = " ".join(value.replace("�", "-").split())
+    return cleaned or None
+
+
+async def _best_title(card, link) -> str | None:
+    """Pick the fullest product name the card offers.
+
+    Layouts disagree about which element holds it. Live probing of one results page
+    found every Oral-B card carrying only the brand in both the heading and the anchor
+    (`h2` = "Oral-B", anchor empty) while the result image's alt text held the complete
+    name ("Oral-B Complete Deep Clean Soft Bristles Toothbrush 4 Count"). The image alt
+    is therefore a first-class source, not a last resort: without it the user sees five
+    identical "Oral-B" lines and cannot tell the options apart.
     """
     candidates = []
     heading = card.locator("h2").first
     if await heading.count():
         candidates.append(await _text_or_none(heading))
     candidates.append(await _text_or_none(link))
-    usable = [value for value in candidates if value]
+    image = card.locator("img.s-image").first
+    if await image.count():
+        try:
+            candidates.append(await image.get_attribute("alt"))
+        except Exception:
+            pass
+    usable = [cleaned for cleaned in (_clean_title(value) for value in candidates) if cleaned]
     return max(usable, key=len) if usable else None
 
 
@@ -322,6 +359,37 @@ def _is_amazon_product_url(url: str) -> bool:
     return urlparse(url).hostname in {"amazon.com", "www.amazon.com"}
 
 
+ASIN_IN_URL = re.compile(r"/dp/([A-Za-z0-9]{6,14})")
+
+
+def asin_from_url(url: str) -> str | None:
+    """Amazon's own identifier for the product, when the link carries one."""
+    match = ASIN_IN_URL.search(url or "")
+    return match.group(1) if match else None
+
+
+# Internal alias kept so extraction code reads consistently with the rest of the module.
+_asin_from_url = asin_from_url
+
+
+def _usable_price(price: str | None) -> str | None:
+    """Reject a price that cannot be a real offer.
+
+    Live results include cards whose offscreen price span reads "$0.00" for listings
+    with no purchasable offer. Sorting treats that as the cheapest option and would
+    put an unbuyable item first, so it is recorded as no price rather than as free.
+    """
+    if not price:
+        return None
+    digits = re.search(r"\d[\d,]*(?:\.\d{1,2})?", price)
+    if not digits:
+        return None
+    try:
+        return None if float(digits.group().replace(",", "")) <= 0 else price
+    except ValueError:
+        return None
+
+
 async def _page_for_query(context, query: str):
     """Prefer the matching visible Amazon tab; never reuse a different search result page."""
     pages = list(context.pages)
@@ -335,14 +403,36 @@ async def _page_for_query(context, query: str):
     return (pages[-1] if pages else await context.new_page()), False
 
 
-async def _search_in_context(context, query: str) -> list[Product]:
+def _search_url(query: str, max_price: float | None, min_price: float | None = None) -> str:
+    """Build the results URL, asking Amazon itself to apply the price bounds.
+
+    Verified live: `low-price`/`high-price` are honoured and return a genuinely
+    different result set. Two other approaches were tried and rejected — `rh=p_36:...`
+    and `s=price-asc-rank` both returned "Sorry! Something went wrong!", so neither is
+    used.
+    """
+    url = f"{AMAZON_SEARCH_URL}?k={quote_plus(query)}"
+    if max_price is not None or min_price is not None:
+        low = f"{min_price:g}" if min_price is not None and min_price > 0 else ""
+        high = f"{max_price:g}" if max_price is not None and max_price > 0 else ""
+        url += f"&low-price={low}&high-price={high}"
+    return url
+
+
+async def _search_in_context(
+    context, query: str, *, max_price: float | None = None, min_price: float | None = None
+) -> list[Product]:
     """Extract public product records using an already-open persistent context."""
     normalized_query = query.strip()
     if not normalized_query:
         raise ValueError("Amazon search requires a non-empty query.")
 
     page, already_matching_query = await _page_for_query(context, normalized_query)
-    search_url = f"{AMAZON_SEARCH_URL}?k={quote_plus(normalized_query)}"
+    # A page already showing this query is showing it *unfiltered*, so it must not be
+    # reused when a price ceiling is being applied.
+    if max_price is not None or min_price is not None:
+        already_matching_query = False
+    search_url = _search_url(normalized_query, max_price, min_price)
     try:
         if not already_matching_query:
             await page.goto(
@@ -368,6 +458,7 @@ async def _search_in_context(context, query: str) -> list[Product]:
 
         products: list[Product] = []
         seen_urls: set[str] = set()
+        seen_asins: set[str] = set()
         cards = page.locator(PRODUCT_CARD_SELECTOR)
         for index in range(await cards.count()):
             if len(products) == MAX_SEARCH_RESULTS:
@@ -383,6 +474,11 @@ async def _search_in_context(context, query: str) -> list[Product]:
             url = urljoin(page.url, href)
             if not _is_amazon_product_url(url) or url in seen_urls:
                 continue
+            # Amazon nests result cards, so the same product is reachable more than once
+            # under URLs that differ only by tracking path. Identity is the ASIN.
+            asin = _asin_from_url(url)
+            if asin and asin in seen_asins:
+                continue
 
             title = await _best_title(card, link)
             if not title:
@@ -392,6 +488,9 @@ async def _search_in_context(context, query: str) -> list[Product]:
             price, rating, review_count, prime_eligible = _result_metadata_from_html(
                 card_html
             )
+            price = _usable_price(price)
+            image = card.locator("img.s-image").first
+            image_url = await image.get_attribute("src") if await image.count() else None
             product = Product(
                 title=title,
                 price=price,
@@ -400,8 +499,12 @@ async def _search_in_context(context, query: str) -> list[Product]:
                 review_count=review_count,
                 prime_eligible=prime_eligible,
                 delivery=_delivery_from_html(card_html),
+                unit_price=_unit_price_from_html(card_html),
+                image_url=image_url,
             )
             seen_urls.add(url)
+            if asin:
+                seen_asins.add(asin)
             products.append(product)
         return products
     except PlaywrightTimeoutError as error:
@@ -424,57 +527,54 @@ async def _cart_count(page) -> int | None:
         return None
 
 
-async def add_to_cart(product_url: str, quantity: int = 1, *, visible: bool = False) -> int | None:
-    """Add one product to the real Amazon cart. Never begins or submits an order.
-
-    Returns the cart count after the click when Amazon reports one, so the caller can
-    confirm the write really happened instead of assuming it did.
-    """
-    if not cart_writes_enabled():
-        raise AmazonCartUnavailable("Cart writes are disabled (AMAZON_ENABLE_CART=false).")
-    if not _is_amazon_product_url(product_url):
-        raise AmazonCartUnavailable("Refusing a non-canonical Amazon product URL.")
-    _refuse_ordering_url(product_url)
-
-    async with _persistent_browser_context(headless=None if not visible else False) as context:
-        page = await context.new_page()
-        try:
-            await page.goto(product_url, wait_until="domcontentloaded", timeout=25_000)
-            before = await _cart_count(page)
-
-            button = page.locator(f"#{ADD_TO_CART_BUTTON_ID}")
-            if not await button.count():
-                raise AmazonCartUnavailable(
-                    "No Add to Cart control on this page; it may be unavailable or a variation picker."
-                )
-            # Defence in depth: confirm the resolved element is the intended control.
-            resolved_id = await button.first.get_attribute("id")
-            if resolved_id != ADD_TO_CART_BUTTON_ID:
-                raise AmazonCartUnavailable(f"Unexpected control id {resolved_id!r}; refusing to click.")
-
-            if quantity > 1:
-                selector = page.locator("#quantity")
-                if await selector.count():
-                    try:
-                        await selector.first.select_option(str(min(quantity, 30)))
-                    except Exception:
-                        print("[AMAZON] quantity selector rejected the value; adding one")
-
-            await button.first.click()
-            await page.wait_for_load_state("domcontentloaded", timeout=20_000)
-            _refuse_ordering_url(page.url)
-            after = await _cart_count(page)
-            print(f"[AMAZON] add_to_cart cart_count before={before} after={after}")
-            if after is None:
-                raise AmazonCartUnavailable("Could not confirm the item reached the cart.")
-            return after
-        finally:
-            await page.close()
-
-
 CART_ROW_SELECTOR = "[data-asin][data-itemid], .sc-list-item[data-asin]"
 CART_PRICE_SELECTOR = ".sc-item-price-block .a-price .a-offscreen"
 CART_DELETE_SELECTOR = "input[value='Delete']"
+
+
+ADD_TO_CART_WAIT_MS = 10_000
+
+
+async def _add_to_cart_button(page):
+    """Return the Add to Cart control, waiting for the product page to settle first.
+
+    Two things made this report "No Add to Cart control on this page" for items that
+    were in stock and perfectly addable:
+
+    - The buybox is attached after DOMContentLoaded, so counting straight after
+      navigation sees nothing.
+    - Product pages redirect to a variation URL (`/dp/B00CC6XSSQ` becomes
+      `/dp/B00CC6XSSQ?th=1`) *after* load. A locator wait started before that
+      navigation times out even though the button appears moments later.
+
+    So the page is settled first and the button is polled, rather than waiting on a
+    single locator across a navigation that may replace the document underneath it.
+    """
+    deadline = perf_counter() + ADD_TO_CART_WAIT_MS / 1000
+    button = page.locator(f"#{ADD_TO_CART_BUTTON_ID}")
+    try:
+        await page.wait_for_load_state("load", timeout=ADD_TO_CART_WAIT_MS)
+    except PlaywrightTimeoutError:
+        pass
+    while perf_counter() < deadline:
+        _refuse_ordering_url(page.url)
+        try:
+            if await button.count():
+                break
+        except PlaywrightError:
+            pass  # a navigation swapped the document; look again
+        await page.wait_for_timeout(250)
+
+    if not await button.count():
+        raise AmazonCartUnavailable(
+            "No Add to Cart control on this page; it may be unavailable, a variation "
+            "picker, or sold only by third-party sellers."
+        )
+    # Defence in depth: confirm the resolved element is the intended control.
+    resolved_id = await button.first.get_attribute("id")
+    if resolved_id != ADD_TO_CART_BUTTON_ID:
+        raise AmazonCartUnavailable(f"Unexpected control id {resolved_id!r}; refusing to click.")
+    return button
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,21 +596,29 @@ async def add_many_to_cart(items: list[tuple[str, int]]) -> list[CartWriteResult
     if not cart_writes_enabled():
         raise AmazonCartUnavailable("Cart writes are disabled (AMAZON_ENABLE_CART=false).")
 
+    # Validate before opening anything. A URL that can never be written to a cart must
+    # not cost a browser launch, and a list made entirely of bad URLs must not open one
+    # at all.
     results: list[CartWriteResult] = []
+    writable: list[tuple[str, int]] = []
+    for url, quantity in items:
+        try:
+            if not _is_amazon_product_url(url):
+                raise AmazonCartUnavailable("Not a canonical Amazon product URL.")
+            _refuse_ordering_url(url)
+            writable.append((url, quantity))
+        except Exception as error:  # noqa: BLE001 - reported per item, never raised
+            results.append(CartWriteResult(url, quantity, False, str(error)[:120]))
+    if not writable:
+        return results
+
     async with _persistent_browser_context() as context:
         page = await context.new_page()
         try:
-            for url, quantity in items:
+            for url, quantity in writable:
                 try:
-                    if not _is_amazon_product_url(url):
-                        raise AmazonCartUnavailable("Not a canonical Amazon product URL.")
-                    _refuse_ordering_url(url)
                     await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
-                    button = page.locator(f"#{ADD_TO_CART_BUTTON_ID}")
-                    if not await button.count():
-                        raise AmazonCartUnavailable("No Add to Cart control on this page.")
-                    if await button.first.get_attribute("id") != ADD_TO_CART_BUTTON_ID:
-                        raise AmazonCartUnavailable("Unexpected control id; refusing to click.")
+                    button = await _add_to_cart_button(page)
                     if quantity > 1:
                         selector = page.locator("#quantity")
                         if await selector.count():
@@ -603,11 +711,174 @@ async def remove_from_cart(asin: str, *, visible: bool = False) -> int | None:
             await page.close()
 
 
+@dataclass(frozen=True, slots=True)
+class Variant:
+    """One buyable child of a variation listing, identified by its own ASIN."""
+
+    asin: str
+    label: str
+    url: str
+
+
+# Amazon ships the whole variation map inline as
+# "dimensionValuesDisplayData":{"B0FTHJCPFQ":["Swagger","3.8 Ounce (Pack of 1)"],...}.
+# Reading that is exact: every entry is a real child ASIN with the values that
+# identify it. Clicking swatches to discover them would be guesswork by comparison.
+DIMENSION_VALUES = re.compile(
+    r'"dimensionValuesDisplayData"\s*:\s*(\{.*?\})\s*,\s*"', re.DOTALL
+)
+MAX_VARIANTS = 12
+
+
+def _variants_from_html(html: str) -> list[Variant]:
+    """Parse the inline variation map, ignoring anything that is not a child ASIN."""
+    import json
+
+    match = DIMENSION_VALUES.search(html)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(1))
+    except ValueError:
+        return []
+    variants = []
+    for asin, values in data.items():
+        if not re.fullmatch(r"[A-Za-z0-9]{6,14}", str(asin)):
+            continue
+        label = " · ".join(
+            " ".join(str(value).split()) for value in (values or []) if str(value).strip()
+        )
+        if label:
+            variants.append(Variant(asin, label, f"https://www.amazon.com/dp/{asin}"))
+    return variants[:MAX_VARIANTS]
+
+
+async def read_variants(product_url: str) -> list[Variant]:
+    """List the buyable children of a variation listing, or [] when there are none.
+
+    A variation parent has no fixed identity — scent, size, and pack are chosen on the
+    product page — so adding one to a cart either fails or is ambiguous. Resolving to
+    a child ASIN first makes the thing that gets added exactly the thing that was
+    chosen. Read-only; navigates to a product page and nothing else.
+    """
+    if not _is_amazon_product_url(product_url):
+        return []
+    _refuse_ordering_url(product_url)
+    try:
+        async with _persistent_browser_context() as context:
+            page = await context.new_page()
+            try:
+                await page.goto(product_url, wait_until="domcontentloaded", timeout=25_000)
+                await page.wait_for_timeout(1_500)
+                return _variants_from_html(await page.content())
+            finally:
+                await page.close()
+    except Exception as error:  # noqa: BLE001 - a failed read must not block the add
+        print(f"[AMAZON] could not read variants: {error}")
+        return []
+
+
+PRODUCT_TITLE_ID = "#productTitle"
+PRODUCT_PRICE_SELECTOR = "#corePrice_feature_div .a-offscreen, .priceToPay .a-offscreen, #price_inside_buybox"
+
+
+async def read_product(product_url: str) -> Product | None:
+    """Read title and price from one product page. Read-only, never orders."""
+    if not _is_amazon_product_url(product_url):
+        return None
+    _refuse_ordering_url(product_url)
+    try:
+        async with _persistent_browser_context() as context:
+            page = await context.new_page()
+            try:
+                await page.goto(product_url, wait_until="domcontentloaded", timeout=25_000)
+                await page.wait_for_timeout(1_200)
+                title = _clean_title(await _text_or_none(page.locator(PRODUCT_TITLE_ID).first))
+                price = _usable_price(
+                    await _text_or_none(page.locator(PRODUCT_PRICE_SELECTOR).first)
+                )
+                return Product(title=title, price=price, url=product_url) if title else None
+            finally:
+                await page.close()
+    except Exception as error:  # noqa: BLE001
+        print(f"[AMAZON] could not read product: {error}")
+        return None
+
+
+PAYMENTS_URL = "https://www.amazon.com/cpe/managepaymentmethods"
+GLOW_SELECTOR = "#glow-ingress-block, #nav-global-location-slot"
+MASKED_CARD = re.compile(r"[\u2022*x]{2,}\s*(\d{4})", re.IGNORECASE)
+CARD_BRAND = re.compile(r"\b(Visa|Mastercard|American Express|Amex|Discover)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class Destination:
+    """Where an order would ship and what would pay for it, as Amazon reports it.
+
+    Read-only and best-effort. Neither value is entered, changed, or stored anywhere;
+    they exist so the user can see what an order would do before it does it.
+    """
+
+    address_label: str | None = None
+    card_label: str | None = None
+
+
+async def read_destination() -> Destination:
+    """Read the default delivery location and card, without touching checkout.
+
+    The location comes from the cart page's own header rather than the address book:
+    Amazon puts `/a/addresses` behind a fresh sign-in even for a valid session, and
+    this application never authenticates. The card is read from the payments page,
+    masked exactly as Amazon prints it.
+    """
+    address = card = None
+    try:
+        return await _read_destination_in_browser()
+    except Exception as error:  # noqa: BLE001 - display only; never break a reply
+        print(f"[AMAZON] could not read destination: {error}")
+        return Destination(None, None)
+
+
+async def _read_destination_in_browser() -> Destination:
+    address = card = None
+    async with _persistent_browser_context() as context:
+        page = await context.new_page()
+        try:
+            await page.goto(CART_URL, wait_until="domcontentloaded", timeout=25_000)
+            _refuse_ordering_url(page.url)
+            await page.wait_for_timeout(1_500)
+            raw = await _text_or_none(page.locator(GLOW_SELECTOR).first)
+            if raw:
+                address = " ".join(raw.replace("\u200c", "").split())
+                address = re.sub(r"^Deliver to\s*", "", address, flags=re.IGNORECASE) or None
+
+            await page.goto(PAYMENTS_URL, wait_until="domcontentloaded", timeout=25_000)
+            _refuse_ordering_url(page.url)
+            await page.wait_for_timeout(2_500)
+            body = " ".join((await page.locator("body").inner_text()).split())
+            masked = MASKED_CARD.search(body)
+            if masked:
+                brand = CARD_BRAND.search(body)
+                card = f"{brand.group(1) if brand else 'Card'} ending {masked.group(1)}"
+        except Exception as error:  # noqa: BLE001 - display only; never break a reply
+            print(f"[AMAZON] could not read destination: {error}")
+        finally:
+            await page.close()
+    return Destination(address, card)
+
+
 SEARCH_ATTEMPTS = 2
 
 
-async def search_products(query: str) -> list[Product]:
+async def search_products(
+    query: str, *, max_price: float | None = None, min_price: float | None = None
+) -> list[Product]:
     """Return up to five visible Amazon search results from the local profile.
+
+    `max_price` is applied by Amazon, not by us. Filtering a page of results we already
+    hold can only remove; asking Amazon for the cheaper page actually finds things. For
+    "dove body wash" the unfiltered page starts at $10.97, while the same query under a
+    $10 ceiling returns six listings from $5.47.
 
     The first search after the browser starts pays a cold-start cost and was observed
     timing out where an immediate repeat succeeded, so one retry is made before
@@ -617,7 +888,9 @@ async def search_products(query: str) -> list[Product]:
     for attempt in range(1, SEARCH_ATTEMPTS + 1):
         try:
             async with _persistent_browser_context() as context:
-                return await _search_in_context(context, query)
+                return await _search_in_context(
+                    context, query, max_price=max_price, min_price=min_price
+                )
         except AmazonSearchUnavailable as error:
             last_error = error
             print(f"[AMAZON] search attempt {attempt} found no results: {error}")

@@ -27,6 +27,9 @@ class MenuAction(StrEnum):
     CHECKOUT = "checkout"
     CONFIRM = "confirm"
     KEEP_SHOPPING = "keep_shopping"
+    PLACE_ORDER = "place_order"
+    CHOOSE_VARIANT = "choose_variant"   # payload: child ASIN
+    SET_QUANTITY = "set_quantity"       # payload: the quantity, or None to ask
     CANCEL = "cancel"
 
 
@@ -44,12 +47,27 @@ class MenuOption:
         return {"action": self.action.value, "label": self.label, "payload": self.payload}
 
     @classmethod
-    def from_record(cls, record: dict[str, Any]) -> "MenuOption":
-        return cls(
-            action=MenuAction(record["action"]),
-            label=record["label"],
-            payload=record.get("payload"),
-        )
+    def from_record(cls, record: dict[str, Any]) -> "MenuOption | None":
+        """Rebuild a stored option, or None when its action no longer exists.
+
+        Menus outlive the code that wrote them. ADR-041 made workflow *fields*
+        tolerant but left actions strict, so retiring one would raise inside
+        `get_active_workflow()` — which runs on the first line of every message — and
+        break every incoming message for anyone holding a saved workflow.
+        """
+        try:
+            action = MenuAction(record["action"])
+        except (KeyError, ValueError):
+            return None
+        return cls(action=action, label=record.get("label", ""), payload=record.get("payload"))
+
+
+# A choice followed by the instruction it needs: "6 dont want to pay over 10 bucks".
+# Without this the whole sentence fell through to Amazon as a search query and came
+# back with "A Smell of Honey" — a real listing, and nothing the user asked for.
+NUMERIC_WITH_ARGUMENT = re.compile(r"^\s*[#(]?\s*(\d{1,2})\s*[).:,\-–]?\s+(\S.*)$", re.DOTALL)
+# Several choices at once: "1,2" or "1 and 3". Used for removing more than one item.
+MULTI_CHOICE = re.compile(r"^\s*\d{1,2}(?:\s*(?:,|and|&|\+)\s*\d{1,2})+\s*[.!]?\s*$", re.IGNORECASE)
 
 
 def choose(message: str, options: list[MenuOption]) -> MenuOption | None:
@@ -61,6 +79,41 @@ def choose(message: str, options: list[MenuOption]) -> MenuOption | None:
         return None
     index = int(match.group(1))
     return options[index - 1] if 1 <= index <= len(options) else None
+
+
+def choose_with_argument(
+    message: str, options: list[MenuOption]
+) -> tuple[MenuOption, str] | None:
+    """Read a choice that carries its own instruction, or None.
+
+    Only a number that names a real option counts, so an ordinary sentence starting
+    with a digit is not mistaken for a menu pick.
+    """
+    if not options:
+        return None
+    match = NUMERIC_WITH_ARGUMENT.match(message or "")
+    if not match:
+        return None
+    index = int(match.group(1))
+    if not 1 <= index <= len(options):
+        return None
+    return options[index - 1], match.group(2).strip()
+
+
+def choose_many(message: str, options: list[MenuOption]) -> list[MenuOption] | None:
+    """Read "1,2" or "1 and 3" as several picks, or None when it is not that."""
+    if not options or not MULTI_CHOICE.match(message or ""):
+        return None
+    numbers = [int(value) for value in re.findall(r"\d{1,2}", message)]
+    if any(not 1 <= number <= len(options) for number in numbers):
+        return None
+    # Order preserved, duplicates dropped, so "2,2,1" removes two distinct items.
+    seen: list[MenuOption] = []
+    for number in numbers:
+        option = options[number - 1]
+        if option not in seen:
+            seen.append(option)
+    return seen or None
 
 
 def render(options: list[MenuOption], *, start: int = 1, heading: str | None = None) -> str:

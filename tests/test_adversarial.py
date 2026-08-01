@@ -20,7 +20,6 @@ import checkout
 import main
 import product_display
 import ranking
-import request_mode
 import workflow_reply
 import workflow_store
 from ranking import SortPreference
@@ -102,7 +101,6 @@ def test_hostile_input_never_crashes_and_never_claims_an_order(message, paths, m
 
 @pytest.mark.parametrize("message", HOSTILE)
 def test_hostile_input_is_classified_without_error(message):
-    assert request_mode.classify(message) in set(request_mode.RequestMode)
     reply = workflow_reply.interpret(message, [_candidate()])
     assert reply.intent in set(workflow_reply.ReplyIntent)
 
@@ -132,7 +130,7 @@ def test_untrusted_titles_are_data_not_instructions(title, paths, monkeypatch):
 
     replies = _drive(paths, monkeypatch, ["widget", "1", "checkout", "place the order"], products=products)
 
-    assert "cannot place this order" in replies[-1]
+    assert "NO ORDER WAS PLACED" in replies[-1]
     workflow = workflow_store.get_workflow(777, paths[1])
     assert workflow.state not in {WorkflowState.PLACING_ORDER, WorkflowState.COMPLETED}
 
@@ -238,11 +236,15 @@ def test_confirming_twice_does_not_double_anything(paths, monkeypatch):
     replies = _drive(paths, monkeypatch,
                      ["find me AA batteries", "1", "checkout", "confirm", "confirm"])
 
-    assert "cannot place this order" in replies[3]
+    assert "NO ORDER WAS PLACED" in replies[3]
     assert replies[4].strip()
+    # Placing an order ends the session, so the list is empty afterwards rather than
+    # still holding items that were just ordered. Confirming again must not resurrect
+    # them or order anything else.
     workflow = workflow_store.get_workflow(777, paths[1])
-    assert len(workflow.cart) == 1
-    assert workflow.cart[0].quantity == 1
+    assert workflow.cart == []
+    # The second confirm finds nothing to act on and says so, rather than re-ordering.
+    assert "nothing to confirm" in replies[4]
 
 
 def test_cancelling_mid_checkout_clears_everything(paths, monkeypatch):
@@ -469,8 +471,9 @@ def test_empty_or_odd_search_results_are_handled(results, paths, monkeypatch):
     ],
 )
 def test_non_canonical_urls_are_refused_by_cart_writes(url):
-    with pytest.raises(amazon.AmazonCartUnavailable):
-        asyncio.run(amazon.add_to_cart(url))
+    results = asyncio.run(amazon.add_many_to_cart([(url, 1)]))
+
+    assert results and not results[0].added, f"{url!r} must never be written to a cart"
 
 
 @pytest.mark.parametrize(

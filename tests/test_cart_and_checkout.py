@@ -139,14 +139,21 @@ def test_place_order_always_refuses():
 
 
 def test_no_module_calls_place_order():
-    """The refusal is only meaningful if nothing invokes it."""
+    """The refusal is only meaningful if nothing invokes it.
+
+    The menu now has a PLACE_ORDER action and agent.py has a screen that mocks up a
+    completed order, so the name legitimately appears outside checkout.py. What must
+    never appear is a *call*: `place_order(` or `checkout.place_order`.
+    """
     import pathlib
+    import re
 
     source = pathlib.Path(__file__).resolve().parent.parent / "src"
+    call = re.compile(r"checkout\.place_order|(?<![\w.])place_order\s*\(")
     callers = [
         path.name
         for path in source.glob("*.py")
-        if path.name != "checkout.py" and "place_order" in path.read_text()
+        if path.name != "checkout.py" and call.search(path.read_text())
     ]
 
     assert callers == []
@@ -160,7 +167,7 @@ def test_amazon_boundary_can_add_to_cart_but_never_order():
         name for name in dir(amazon) if not name.startswith("_") and callable(getattr(amazon, name))
     }
 
-    assert "add_to_cart" in implemented
+    assert "add_many_to_cart" in implemented
     assert implemented & {"place_order", "place_confirmed_order", "buy_now", "submit_order", "checkout"} == set()
 
 
@@ -188,7 +195,7 @@ def test_cart_writes_can_be_switched_off(monkeypatch):
     with pytest.raises(amazon.AmazonCartUnavailable):
         import asyncio
 
-        asyncio.run(amazon.add_to_cart("https://www.amazon.com/dp/B079GXSFPB"))
+        asyncio.run(amazon.add_many_to_cart([("https://www.amazon.com/dp/B079GXSFPB", 1)]))
 
 
 def test_a_click_that_does_not_change_the_cart_is_reported_as_a_failure(monkeypatch):
@@ -218,6 +225,11 @@ def test_a_click_that_does_not_change_the_cart_is_reported_as_a_failure(monkeypa
             return None
 
         async def select_option(self, value):
+            return None
+
+        async def wait_for(self, *args, **kwargs):
+            # The buybox is attached after DOMContentLoaded, so the real code waits
+            # for it before deciding the control is absent.
             return None
 
     class Page:
@@ -265,8 +277,11 @@ def test_add_to_cart_refuses_a_non_canonical_url(monkeypatch):
 
     monkeypatch.setenv("AMAZON_ENABLE_CART", "true")
 
-    with pytest.raises(amazon.AmazonCartUnavailable):
-        asyncio.run(amazon.add_to_cart("https://evil.example.com/dp/B0TEST"))
+    # add_many_to_cart reports per item rather than raising, so one bad URL cannot
+    # abandon the rest of an approved list.
+    results = asyncio.run(amazon.add_many_to_cart([("https://evil.example.com/dp/B0TEST", 1)]))
+    assert results and not results[0].added
+    assert "canonical" in (results[0].detail or "")
 
 
 def test_workflow_never_reaches_a_placing_order_state():

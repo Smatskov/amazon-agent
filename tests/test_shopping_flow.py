@@ -81,11 +81,13 @@ def test_checkout_shows_exact_contents_and_names_what_is_unknown(paths, monkeypa
     _run("1", paths)
     reply = _run("checkout", paths)
 
-    assert "Order summary" in reply
-    assert "$18.49" in reply
+    # Checking out is now one step: it shows the summary and pushes to the Amazon cart.
+    assert "IN YOUR AMAZON CART" in reply
+    # Option 1 is the cheapest per item ($12.00/16 beats $18.49/24), not Amazon's first.
+    assert "$12.00" in reply
     assert "shipping cost" in reply
     assert "The real total will be higher." in reply
-    assert workflow_store.get_active_workflow(USER, paths[1]).state == WorkflowState.AWAITING_CHECKOUT_CONFIRMATION
+    assert workflow_store.get_active_workflow(USER, paths[1]).state == WorkflowState.PAUSED
 
 
 def test_checkout_with_an_empty_list_is_refused(paths, monkeypatch):
@@ -111,7 +113,9 @@ def test_every_way_of_asking_to_buy_reaches_the_refusal(paths, monkeypatch, mess
     _run("checkout", paths)
     reply = _run(message, paths)
 
-    assert "I cannot place this order" in reply
+    # The items are in the Amazon cart by now, so buy phrasing reaches the order
+    # screen — which states on its first line that no order was placed.
+    assert "NO ORDER WAS PLACED" in reply
     generate.assert_not_awaited()
 
 
@@ -120,27 +124,30 @@ def test_confirming_records_approval_but_places_nothing(paths, monkeypatch):
 
     _run("find me AA batteries", paths)
     _run("1", paths)
-    _run("checkout", paths)
-    reply = _run("confirm", paths)
+    reply = _run("checkout", paths)
 
-    assert "Confirmed: 1 item(s), items subtotal $18.49" in reply
-    assert "cannot place this order" in reply
+    assert "$12.00" in reply
+    assert "IN YOUR AMAZON CART" in reply
     workflow = workflow_store.get_active_workflow(USER, paths[1])
     assert workflow.confirmed_token is not None
     assert workflow.state != WorkflowState.PLACING_ORDER
     assert workflow.state != WorkflowState.COMPLETED
 
 
-def test_declining_at_the_gate_returns_to_the_list_without_ordering(paths, monkeypatch):
+def test_checking_out_twice_does_not_push_the_same_items_twice(paths, monkeypatch):
+    """Checkout writes to the real Amazon cart, so repeating it must be idempotent."""
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_products()))
+    push = AsyncMock(return_value=[amazon.CartWriteResult("https://www.amazon.com/dp/b", 1, True)])
+    monkeypatch.setattr(agent.amazon, "add_many_to_cart", push)
+    monkeypatch.setattr(agent.amazon, "read_cart", AsyncMock(return_value=[]))
 
     _run("find me AA batteries", paths)
     _run("1", paths)
     _run("checkout", paths)
-    reply = _run("no", paths)
+    reply = _run("checkout", paths)
 
-    assert "Not confirmed — nothing was ordered." in reply
-    assert workflow_store.get_active_workflow(USER, paths[1]).state == WorkflowState.PREPARING_CART
+    assert push.await_count == 1, "the second checkout must not re-add the items"
+    assert "already in your Amazon cart" in reply
 
 
 def test_changing_the_list_after_confirming_invalidates_the_confirmation(paths, monkeypatch):
@@ -149,8 +156,7 @@ def test_changing_the_list_after_confirming_invalidates_the_confirmation(paths, 
     _run("find me AA batteries", paths)
     _run("1", paths)
     _run("checkout", paths)
-    _run("confirm", paths)
-    # Change the contents after confirming.
+    # Change the contents after checking out (which is what confirms and pushes).
     workflow = workflow_store.get_active_workflow(USER, paths[1])
     import cart as cart_module
     workflow.cart = cart_module.set_quantity(workflow.cart, workflow.cart[0].candidate_id, 5)

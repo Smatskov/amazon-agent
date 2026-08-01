@@ -82,7 +82,11 @@ def test_pack_count_with_no_matching_variant_asks_instead_of_guessing(aa_batteri
     resolution = resolve_candidate_reference("the 10-count pack", aa_batteries)
 
     assert resolution.candidate is None
-    assert "More than one option" in resolution.message
+    # Every candidate matching equally (all of them say "pack") means the words told
+    # the agent nothing, so it asks for a number rather than claiming an ambiguous
+    # match it cannot actually narrow.
+    assert "couldn't tell which option" in resolution.message
+    assert not resolution.ambiguous
 
 
 def test_unmatched_reference_names_the_valid_option_range(aa_batteries):

@@ -356,3 +356,276 @@ a number, instead of searching Amazon for those words.
 ### ISSUE-023 — Quantity can no longer be changed — **OPEN, introduced by this change**
 `_change_quantity` was reachable only through the deleted semantic path. Adding more than
 one of an item is currently not possible. Needs a "Change quantity" menu option.
+
+
+---
+
+## UAT session 5 — 2026-07-31, melatonin, Oral-B, and the shared Amazon cart
+
+Fourteen observations were reported. They reduced to six causes. Findings marked
+**live-verified** were confirmed with a read-only DOM probe against real Amazon
+results, and in one case the probe reversed the intended fix.
+
+### ISSUE-024 — An unrelated $99 placement was option 1 — **FIXED** (ADR-053)
+
+**Seen:** `melatonin 10mg` → `1 · One Medical Membership: Get 24/7 on-demand care for
+50+ conditions and more — $99.00`. Typing `1` would have listed a subscription.
+
+**Root cause, live-verified:** the card carries a real ASIN, a real price, and a `/dp/`
+link, so the extractor could not tell it from a product. **The probe also showed it
+carries no sponsored marker of any kind, while the three genuine melatonin products
+did** — marker-based ad filtering would have deleted the good results and kept the ad.
+
+**Fix:** drop results sharing no significant word with the query; never empty the list.
+**Live-verified after the fix:** `dropped as unrelated: 1`, One Medical gone.
+
+### ISSUE-025 — Results were not ordered by price — **FIXED** (ADR-054)
+
+Amazon's own order was passed through unchanged, which leads with placements. Now
+cheapest-per-item first unless the user asks for rating or speed.
+**Live-verified:** `oral b toothbrush 4 pack` now leads with `$6.42 ($1.60 ea)`.
+
+### ISSUE-006 — Brand-only titles — **FIXED** (was OPEN since session 1)
+
+**Seen:** five results all reading `Oral-B`, one of which the user reasonably concluded
+the agent had invented. It had not — the products were real, the titles were not read.
+
+**Root cause, live-verified:** on that layout `h2` holds only the brand and the anchor
+text is empty, so taking the longer of the two still yields the brand. **The result
+image's `alt` holds the complete name.**
+
+**Fix:** `img.s-image[alt]` is now a first-class title source. Replacement characters
+(`U+FFFD`) in titles are cleaned.
+**Live-verified:** `Oral-B` → `Oral-B Complete Deep Clean Soft Bristles Toothbrush 4 Count`.
+
+### ISSUE-026 — Narrowing by brand found nothing — **FIXED** (ADR-053, agent `_search_again`)
+
+**Seen:** the agent offered "a brand" as a way to narrow; `natures bounty` replied
+"Nothing I found matches that" and reprinted the same unfiltered list.
+
+**Root cause:** three bugs. The filter did a raw substring test, so `natures` did not
+match `nature's` or `nature`. The re-search re-ran the *original* query and re-applied
+the same filter, so a brand outside the first five could never be found. The zero-match
+reply reprinted the old list with nothing marking it stale.
+
+**Fix:** token matching with possessive/plural folding and one-edit typo tolerance; the
+narrowing is folded into the Amazon query (`natures bounty melatonin 10mg`); the
+zero-match reply now says the results are the earlier ones, unchanged.
+
+### ISSUE-027 — The answer to "What should I look for?" was rejected — **FIXED** (ADR-055)
+
+**Seen:** the agent asked what to look for; the reply `oral b branded toothpaste 4 pack`
+was answered with "More than one option matches that description."
+
+**Root cause:** "Search for something else" cleared the *menu* but left
+`workflow.candidates` populated, so the answer fell into the stale-candidate resolver.
+
+### ISSUE-028 — A number stopped working while still on screen — **FIXED** (ADR-056)
+
+**Seen:** `3` → "Which product should I search for on Amazon?" while numbered results
+were still visible in the chat.
+
+**Root cause:** the menu was cleared server-side while its numbers remained on the
+user's screen, breaking ADR-052's core guarantee.
+
+### ISSUE-029 — Naming a product silently added a stale result — **FIXED** (ADR-055)
+
+**Seen:** `oral-B toothbrushes 6 pack` was intended as a search and instead added an
+item to the list.
+
+**Root cause:** it matched a previous result on four words. **Amazon was never queried.**
+The product it picked happened to be sensible, which made the bug look like a feature.
+
+### ISSUE-030 — "Which option do you mean?" arrived with no options — **FIXED** (ADR-056)
+
+### ISSUE-031 — The remove menu showed no prices — **FIXED**
+
+Dropping an item is a money decision; each line now shows its price.
+
+### ISSUE-032 — The Amazon cart held an item the agent never added — **FIXED** (ADR-057)
+
+**Seen:** confirmed summary read "2 item(s), items subtotal $22.95"; the real Amazon
+cart showed a $1.98 pack of coffee filters from an earlier session and a subtotal of
+$6.94. The agent's list and the real cart are different things and nothing said so.
+
+**Why it matters:** harmless while ordering is refused (ADR-049). Once ordering exists,
+confirming would buy the stranger. The reconciliation had to land first.
+
+### ISSUE-033 — "No Add to Cart control on this page" for an addable item — **FIXED, live-confirmed**
+
+**Seen:** the Oral-B 6-pack failed to add during a confirmation that otherwise worked.
+
+**Root cause, live-verified — two mechanisms, and the second was the real one:**
+
+1. The buybox is attached *after* `DOMContentLoaded`, so counting the button straight
+   after navigation sees nothing.
+2. **Product pages redirect to a variation URL after load** — `/dp/B00CC6XSSQ` becomes
+   `/dp/B00CC6XSSQ?th=1`. A locator wait started before that navigation times out even
+   though the button appears moments later. Three of four probed products redirected.
+   A first fix that only waited on the locator still failed 3 of 4; polling after
+   settling the page found the control on 4 of 4, in 1.5-2.5 seconds.
+
+**Fix:** settle the page (`wait_for_load_state("load")`), then poll for the control,
+re-checking the URL against the ordering-refusal list on every pass.
+
+**Live-confirmed end to end** with the user's authorisation: `add_many_to_cart` on the
+exact item that had failed returned `added=True`, the cart went 2 -> 3, `read_cart()`
+showed the item, and `remove_from_cart()` returned it to 2. Nothing was left behind.
+
+**Also confirmed by that run:** `read_cart()` correctly identifies a pre-existing item
+(the coffee filters, ASIN B0C4Z6SKCS) as one the agent did not add (ISSUE-032), and
+`remove_from_cart()` works — which is the capability ISSUE-017 needs.
+
+### ISSUE-039 — A failed narrowing still displayed the products it rejected — **FIXED**
+
+**Seen:** "Nothing matched" followed immediately by the five results that had just
+failed the filter, which read as a successful narrowing and invited the user to pick
+one of the excluded items.
+
+**Fix:** nothing is shown. A menu offers to show the previous results, narrow
+differently, search again, or start over.
+
+### ISSUE-040 — A price range was parsed as a keyword — **FIXED**
+
+**Seen:** `between 10 and 20 dollars` returned "nothing matched" when a $10.97 and a
+$17.99 result were both on screen.
+
+**Root cause:** `MAX_PRICE_PHRASE` matches only "under/below/less than/max". A range
+matched nothing, so the leftover words "between" and "dollars" became a **keyword the
+title had to contain** — which excluded every product. Separately, `under 10` reported
+nothing matched while Amazon had six Dove body washes from $5.47, because the
+re-search asked Amazon for the same unfiltered page.
+
+**Fix:** ranges are parsed in every written form ("between 10 and 20 dollars",
+"$10-$20", "from 10 to 20"), `min_price` is enforced alongside `max_price`, money words
+can never become a keyword, and both bounds are sent to Amazon as `low-price`/
+`high-price`. **Live-verified:** those parameters are honoured; `rh=p_36:...` and
+`s=price-asc-rank` both returned "Sorry! Something went wrong!" and are not used.
+
+### ISSUE-034 — A stated pack size is not enforced — **WONTFIX**
+
+Closed at the user's direction: whatever Amazon returns for the query is acceptable,
+whether or not it honours a stated count.
+
+### ISSUE-041 — Repeated automated probing trips an Amazon interstitial — **OPEN**
+
+During diagnosis, one product page returned `title: "Amazon.com"` with no buybox after
+a burst of automated page loads; a later run with pauses returned the real page. Live
+diagnosis should be spaced out. This is a testing hazard, not a user-facing bug.
+
+### ISSUE-034 — A stated pack size is not enforced — **OPEN**
+
+`oral b toothbrush 4 pack` still returns 6-packs among the 4-packs. Amazon returns
+them and relevance filtering keeps them, because they are genuinely toothbrushes. Price
+ordering now surfaces a 4-pack first, so the impact is reduced but not removed.
+`ranking.pack_count()` already reads a pack size from a title; nothing reads one from
+the *query*.
+
+### ISSUE-035 — Auto-add cannot be justified from evidence — **OPEN, needs a decision**
+
+The user asked that an item only be added without showing options when the agent has
+found a specific reason to believe it (for example the product appearing in Amazon
+order history), and that it say what that reason was. **No such evidence source exists
+today:** order history is unverifiable (the test account has zero orders) and the agent
+has no order history of its own because ordering is not implemented. Building the
+justification without the evidence would mean the agent asserting a reason it does not
+have, which is the failure ADR-051 exists to prevent. Until an evidence source exists,
+the honest options are to keep command-mode's single recommendation (which the user
+approves before it is added) or to never auto-add at all.
+
+### ISSUE-036 — Shortened titles lost or mangled the identifying detail — **FIXED**
+
+Once titles were extracted properly (ISSUE-006) they became long enough for the
+shortener to matter, and two defects surfaced:
+
+- `Dove Body Wash with Pump 3 Count Deep Moisture for…` — the cut landed on a function
+  word, reading as a damaged name rather than a shortened one.
+- `Dove Body Wash 2-Pack` — a pack count in the head returned early and dropped
+  `15.2 Oz Ea`, the only thing separating it from a different 2-pack.
+
+**Fix:** trimming never ends on a dangling word, and a size segment is kept even when
+the head already names a pack.
+
+### ISSUE-037 — Five Dove listings looked like the same product repeated — **FIXED by ISSUE-006**
+
+**Seen:** five results all reading `Dove`, four at `$10.97`, indistinguishable.
+
+**Root cause:** not duplicates. Live-verified as five distinct ASINs — Deep Moisture,
+Sensitive Skin with Pump, 3 Count with Pump, 2-Pack, Antibacterial with Pump — that all
+rendered as the brand. True duplicates are already removed by ASIN (ISSUE-024 work).
+
+**Note for testing:** this transcript was produced by a bot process started before the
+title fix landed. **The Telegram bot must be restarted to pick up source changes.**
+
+### ISSUE-038 — "Narrow these results" spent a turn explaining itself — **FIXED**
+
+The menu said only "Narrow these results"; what it accepted was revealed only after the
+user chose it. The label now reads "Narrow these — by brand, budget, or keyword".
+
+---
+
+## UAT session 6 — 2026-08-01, variations, the final screens, and a cleanup pass
+
+### ISSUE-043 — A variation listing could not be added — **FIXED** (ADR-058)
+
+A search result for a variation parent (Old Spice deodorant: scent and pack chosen on
+the product page) was stored as the parent ASIN. `add_many_to_cart` correctly refused
+it, so the item silently failed to add. The agent now reads the children and asks
+which one. **Live-verified**: four listings reported 2-4 real children each.
+
+### ISSUE-044 — A result showed no pack count — **FIXED**
+
+Every line now states the count, or "⚠️ count not stated" when Amazon did not — the
+cue that the product page will ask, and that the price is not per unit.
+
+### ISSUE-023 — Quantity could not be changed — **FIXED** (open since session 4)
+
+"Change a quantity" is now a cart-menu option. Changing one invalidates a previous
+confirmation (ADR-026).
+
+### ISSUE-045 — Titles collapsed to a brand for sponsored listings — **FIXED**
+
+`display_title` split on "|", which Amazon uses as its separator, leaving the brand as
+the head and every descriptive segment too long to keep. Five results all read
+"Dollar Shave Club, 2 Pack". A short leading segment now absorbs the next until the
+name identifies the product.
+
+### ISSUE-046 — Both final screens described the list, not the cart — **FIXED** (ADR-059)
+
+"2 item(s), $35.23" while six items sat in the real Amazon cart. Both terminal screens
+are now built from the whole cart, split into what this conversation added and what was
+already there.
+
+### ISSUE-047 — A placed order left the list populated — **FIXED**
+
+The next screen still offered "View your list (2 items)" for items just ordered.
+
+### ISSUE-048 — A stored menu could make a workflow unreadable — **FIXED** (ADR-060)
+
+Found during the cleanup sweep, not user-reported. An unknown menu action raised inside
+`get_active_workflow()`, which runs on the first line of every message.
+
+### ISSUE-049 — Cart writes opened a browser before validating URLs — **FIXED**
+
+Found during the cleanup sweep. A list made entirely of unusable URLs still launched
+Chromium. URLs are now validated first, and a list with nothing writable opens nothing.
+
+### ISSUE-050 — A corrupt quantity payload could raise — **FIXED**
+
+Found during the cleanup sweep. `_set_quantity` did `int()` on an unvalidated stored
+payload. A stored menu is untrusted input and must not be able to raise inside message
+handling.
+
+### ISSUE-051 — The shipping address cannot be changed from the agent — **WONTFIX (blocked)**
+
+The default delivery location and the card's last four digits are read and displayed
+read-only on both final screens. **Changing them is not possible here:** Amazon puts
+`/a/addresses` behind a fresh sign-in even with a valid session (probe returned
+`Amazon Sign-In`), and this application never authenticates or handles payment details.
+Both are labelled as Amazon defaults, shown read-only, with a note to change them on
+Amazon before ordering.
+
+### ISSUE-052 — Amazon interstitials under rapid automated probing — **OPEN**
+
+Unchanged from session 5. Space live diagnosis out; a burst of page loads returned one
+bot-check page.

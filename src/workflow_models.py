@@ -58,6 +58,10 @@ class Candidate:
     review_count: int | None = None
     prime_eligible: bool | None = None
     source_url: str | None = None
+    # Amazon's own per-unit price, copied verbatim ("$2.27/fluid ounce"). Never
+    # computed here: dividing a price by a size read out of a title invents a fact.
+    unit_price_text: str | None = None
+    image_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +99,18 @@ class PurchaseWorkflow:
     # The numbered choices last shown. Persisted so the number the user sees is the
     # number the agent resolves against, even across a restart.
     pending_menu: list[MenuOption] = field(default_factory=list)
+    # Images for the results just shown, as (url, caption) pairs. Presentation state,
+    # consumed once by the transport and cleared, so a later reply cannot resend a
+    # gallery for products that are no longer on screen.
+    pending_photos: list[list[str]] = field(default_factory=list)
+    # What the real Amazon cart held when it was last read, as [title, price, mine].
+    # The order the user would place is the whole cart, so the last two screens are
+    # built from this rather than from the agent's own list.
+    amazon_cart: list[list] = field(default_factory=list)
+    # Where an order would ship and what would pay: [address, card]. Display only.
+    destination: list = field(default_factory=list)
+    # Children of a variation listing awaiting a choice: [asin, label, url].
+    pending_variants: list[list] = field(default_factory=list)
     cart: list[CartLine] = field(default_factory=list)
     # Identifies the exact order contents the user last confirmed. Any change to the
     # cart produces a different token, which invalidates the confirmation (ADR-026).
@@ -140,11 +156,14 @@ class PurchaseWorkflow:
         data["cart"] = [
             CartLine(**_known_fields(CartLine, line)) for line in record.get("cart") or []
         ]
-        data["pending_menu"] = [
+        # A retired action deserializes to None and is dropped, so a stored menu can
+        # never make an entire workflow unreadable.
+        restored = (
             MenuOption.from_record(option)
             for option in record.get("pending_menu") or []
-            if isinstance(option, dict) and "action" in option
-        ]
+            if isinstance(option, dict)
+        )
+        data["pending_menu"] = [option for option in restored if option is not None]
         return cls(**data)
 
     def to_record(self) -> dict[str, Any]:

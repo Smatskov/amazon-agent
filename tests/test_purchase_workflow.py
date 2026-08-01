@@ -30,10 +30,11 @@ def test_a_search_creates_a_workflow_from_real_records(tmp_path, monkeypatch):
     response = _run("AA batteries", tmp_path)
 
     workflow = workflow_store.get_active_workflow(41, tmp_path / "workflows.db")
-    assert "Results for" in response
+    assert "RESULTS FOR" in response
     assert workflow.state == WorkflowState.AWAITING_PRODUCT_SELECTION
-    assert workflow.candidates[0].title == "Duracell Coppertop AA Batteries, 24 Count"
-    assert workflow.candidates[0].source_url == "https://www.amazon.com/dp/example-aa"
+    # Cheapest per item leads: $11.99/20 beats $18.49/24, so Amazon Basics is option 1.
+    assert workflow.candidates[0].title == "Amazon Basics AA Batteries, 20 Count"
+    assert workflow.candidates[0].source_url == "https://www.amazon.com/dp/example-basics"
     assert workflow.pending_menu, "results must always offer numbered choices"
 
 
@@ -78,7 +79,7 @@ def test_legacy_fabricated_candidates_are_discarded(tmp_path, monkeypatch):
 
     response = _run("AA batteries", tmp_path)
 
-    assert "Results for" in response
+    assert "RESULTS FOR" in response
     workflow = workflow_store.get_active_workflow(41, workflow_path)
     assert all(candidate.source_url for candidate in workflow.candidates)
 
@@ -90,7 +91,7 @@ def test_a_second_search_keeps_the_list(tmp_path, monkeypatch):
     _run("1", tmp_path, user=3)
     response = _run("shampoo", tmp_path, user=3)
 
-    assert "Results for" in response
+    assert "RESULTS FOR" in response
     workflow = workflow_store.get_active_workflow(3, tmp_path / "workflows.db")
     assert workflow.normalized_product_goal == "shampoo"
     assert len(workflow.cart) == 1, "the earlier pick must survive a new search"

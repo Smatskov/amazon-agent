@@ -100,7 +100,12 @@ def test_facts_show_price_and_arrival_but_not_review_counts():
 
 
 def test_facts_report_a_missing_price_rather_than_omitting_it():
-    assert product_display.candidate_facts(_candidate("Mystery")) == "price not shown"
+    # The pack count is now always stated too, including when Amazon did not state it:
+    # a price with no quantity beside it cannot be compared or trusted.
+    facts = product_display.candidate_facts(_candidate("Mystery"))
+
+    assert facts.startswith("price not shown")
+    assert "count not stated" in facts
 
 
 # --- escaping -----------------------------------------------------------------
@@ -137,8 +142,8 @@ def test_results_and_the_list_are_visually_distinct():
 
     assert results.startswith("🔎")
     assert listing.startswith("🧺")
-    assert "Results for" in results
-    assert "Your list" in listing
+    assert "RESULTS FOR" in results
+    assert "YOUR LIST" in listing
 
 
 def test_no_raw_markdown_reaches_the_user():
@@ -186,7 +191,9 @@ def test_cart_shows_quantities_and_a_subtotal():
 def test_cart_always_says_it_is_not_the_amazon_cart():
     message = product_display.present_cart([CartLine("a", "Thing", 1.0, 1, "$1")], 1.0, _actions())
 
-    assert "nothing is in your Amazon cart yet" in message
+    # It must not claim the Amazon cart is empty — it said so while four unrelated
+    # items were sitting in it. It speaks only about the items on this list.
+    assert "have not been sent to your Amazon cart" in message
 
 
 def test_an_unknown_price_makes_the_subtotal_unavailable():
@@ -196,7 +203,7 @@ def test_an_unknown_price_makes_the_subtotal_unavailable():
 
 
 def test_empty_cart_message():
-    assert "empty" in product_display.present_cart([], None, _actions())
+    assert "EMPTY" in product_display.present_cart([], None, _actions())
 
 
 @pytest.mark.parametrize("count", [0, 1, 3, 20])

@@ -2,11 +2,11 @@
 from dotenv import load_dotenv
 import os
 import re
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from agent import agent_brain
+from agent import agent_brain, take_pending_photos
 
 TAG = re.compile(r"<[^>]+>")
 
@@ -57,6 +57,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # long responses are preserved without reintroducing incremental streaming.
     for section in sections[1:]:
         await _send(update.message.reply_text, section)
+
+    await _send_photos(update, take_pending_photos(update.effective_user.id))
+
+
+TELEGRAM_ALBUM_LIMIT = 10
+CAPTION_LIMIT = 1024
+
+
+async def _send_photos(update: Update, photos: list[list[str]]) -> None:
+    """Send the product images for the results just listed.
+
+    Pictures are the only way to judge size and pack from a chat message, so they are
+    worth an extra send. They are strictly an enhancement: any failure is logged and
+    swallowed, because a broken image URL must never cost the user their results.
+    """
+    if not photos:
+        return
+    try:
+        media = [
+            InputMediaPhoto(media=url, caption=caption[:CAPTION_LIMIT])
+            for url, caption in photos[:TELEGRAM_ALBUM_LIMIT]
+            if url
+        ]
+        if len(media) == 1:
+            await update.message.reply_photo(media[0].media, caption=media[0].caption)
+        elif media:
+            await update.message.reply_media_group(media)
+    except Exception as error:  # noqa: BLE001 - images must never break a reply
+        print(f"[TELEGRAM] could not send product images: {error}")
 
 
 async def _send(send, text: str) -> None:

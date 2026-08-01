@@ -1641,3 +1641,305 @@ Consequences:
 - Output is Telegram HTML with `parse_mode` set, and every value from Amazon or the user
   is escaped. Before this, markdown was sent verbatim and the user saw literal
   `**Pick one:**`.
+
+---
+
+## ADR-053 — Relevance to the Query, Not Ad Markers, Removes Junk Results
+
+Status: Accepted and implemented
+
+Decision:
+
+A search result that shares no significant word with the query is dropped before the
+user sees it. Sponsored/ad markers are **not** used. If the filter would remove every
+result, it removes none.
+
+Context:
+
+"melatonin 10mg" offered `1 · One Medical Membership: Get 24/7 on-demand care for 50+
+conditions and more — $99.00` as a selectable product. Typing `1` would have put a $99
+subscription on the list.
+
+A live DOM probe of that results page settled how to fix it, and inverted the obvious
+approach. The One Medical card carried **no** sponsored marker of any kind — not
+`AdHolder`, not `s-sponsored-label`, not `puis-sponsored`, not the word "sponsored".
+The three genuine melatonin products **did** carry one. Filtering on markers would have
+deleted the good results and kept the placement.
+
+Reasoning:
+
+- The discriminator has to be a fact about the product, and the only one available is
+  whether it has anything to do with what was asked for.
+- Token comparison is deterministic, cheap, and explainable, and it needs no
+  maintenance as Amazon changes its ad markup.
+- Requiring only *one* shared word keeps the filter conservative: it removes the
+  obviously unrelated without second-guessing Amazon's relevance ranking.
+- Never emptying the list means a strict filter can annoy but cannot break a search.
+
+Tradeoffs:
+
+- A genuinely relevant product described entirely in synonyms would be dropped. Not
+  observed live across the queries tested.
+- A placement for a product in the same category still passes, because it is relevant.
+  This filter removes junk, not advertising.
+
+Consequences:
+
+- `ranking.relevance()` is the filter; `agent.py` applies it to every new search and
+  re-search. `amazon.py` remains a pure extractor and knows nothing about queries.
+
+---
+
+## ADR-054 — Cheapest Per Item Is the Default Ordering
+
+Status: Accepted and implemented; refines ADR-044
+
+Decision:
+
+When the user states no preference, results are ordered by price ascending — per item
+where every candidate states a pack size, total price otherwise. An explicit request
+for rating or delivery speed still wins.
+
+Context:
+
+ADR-044 made an unstated preference mean "Amazon's own order". Amazon's order leads
+with placements, so the first numbered option was regularly the least useful line on
+the page.
+
+Reasoning:
+
+- Once results are relevance-filtered, price is what a shopper is actually comparing.
+- A predictable ordering makes the numbers mean something across searches.
+
+Tradeoffs:
+
+- The most relevant product may not be option 1. Mitigated by relevance filtering
+  running first, so everything in the list is at least on-topic.
+
+Consequences:
+
+- `ranking.default_sort()` maps an unstated preference to price; `requested_sort()` is
+  unchanged, so the difference between "the user asked" and "we chose" stays visible.
+
+---
+
+## ADR-055 — A Reference Is Short; a Description Is a Search
+
+Status: Accepted and implemented; refines ADR-042
+
+Decision:
+
+Candidate resolution by description applies only to messages of three significant words
+or fewer, and never when every candidate matches equally well. Longer messages are
+searched on Amazon.
+
+Context:
+
+Three UAT failures came from one line: any message arriving with stored candidates was
+matched against them first. With five results all titled "Oral-B" (ADR-006 title bug),
+"oral b branded toothpaste 4 pack" tied across all five and produced "More than one
+option matches that description. Which option do you mean?" — a question with no
+sensible answer. Worse, "oral-B toothbrushes 6 pack" matched one stale result on four
+words and was **added to the list without Amazon ever being queried for it**.
+
+Reasoning:
+
+- A reference points at something visible and is therefore short: "the duracell",
+  "natrol gummies". Naming a product in full is a request, not a pointer.
+- Every candidate matching equally is evidence the words discriminate nothing, which is
+  the opposite of an ambiguous reference. Treating it as ambiguity produced a question
+  the user could not answer.
+- Searching is the safe failure direction: it is visible, reversible, and cheap.
+  Silently adding the wrong item to a list that later writes to a real cart is not.
+
+Tradeoffs:
+
+- A long, deliberate reference now becomes a search. The user sees results rather than
+  an addition, which is recoverable in one turn.
+
+Consequences:
+
+- Explicit positions, ordinals, and comparisons ("cheapest") are unaffected and remain
+  the unambiguous way to pick.
+
+---
+
+## ADR-056 — A Menu Outlives the Turn That Printed It
+
+Status: Accepted and implemented; refines ADR-052
+
+Decision:
+
+Choosing "Search for something else" or "Narrow these results" keeps the current
+results menu live. Menus without product choices — cart, checkout — are still cleared.
+No reply that asks the user to choose is sent without a menu attached.
+
+Context:
+
+ADR-052 guarantees that the number shown is the number resolved. Clearing the menu
+broke it: the results were still visible in the chat, so `3` still looked valid, but
+the agent had forgotten the menu and answered "Which product should I search for on
+Amazon?". Separately, "More than one option matches that description" was sent as a
+bare sentence with nothing to pick from.
+
+Reasoning:
+
+- The user's screen, not the agent's state, decides what looks selectable.
+- A cart menu must still be dropped: reusing "1 · Check out" after moving on would act
+  on an intent the user has left behind.
+
+Consequences:
+
+- `agent._keep_only_product_menu()` retains a menu only when it offers products, and
+  `agent._with_menu()` attaches the pending menu to every choose-one question.
+
+---
+
+## ADR-057 — The Real Amazon Cart Is Reconciled Against the List at Confirmation
+
+Status: Accepted and implemented
+
+Decision:
+
+After the approved list is pushed to the real Amazon cart, the cart is read back and
+anything in it that this conversation did not add is named in the reply. A failed read
+is reported to the log and never breaks the confirmation.
+
+Context:
+
+A confirmed summary read "2 item(s), items subtotal $22.95" while the real Amazon cart
+held a $1.98 pack of coffee filters left from an earlier session and one of the two
+items had silently failed to add. The summary described the agent's list; the order the
+user would place is the whole cart. Those are different things and nothing said so.
+
+Reasoning:
+
+- ADR-026 requires the user to review what they are approving. Reviewing a list that is
+  not the thing that would be bought does not satisfy that.
+- This is tolerable only while ordering is refused (ADR-049). It has to exist *before*
+  ordering is implemented, not alongside it.
+- `amazon.read_cart()` already existed and was unused.
+
+Tradeoffs:
+
+- One extra page read per confirmation.
+- Items the user deliberately keeps in their cart are reported every time.
+
+Consequences:
+
+- The ADR-046 expiry question and ISSUE-017 (removal not reaching the real cart) are
+  now the remaining gaps between the agent's list and the real cart.
+
+---
+
+## ADR-058 — A Variation Listing Is Resolved to a Child ASIN Before Anything Is Added
+
+Status: Accepted and implemented
+
+Decision:
+
+When a chosen search result is a variation parent, the agent reads its children and
+asks which one, as a numbered menu. What reaches the cart is always the child ASIN the
+user picked, priced from that child's own product page.
+
+Context:
+
+A search result for a variation parent has no fixed identity: scent, size, and pack are
+chosen on the product page, and the page can raise the quantity further. The agent
+stored the parent ASIN, `add_many_to_cart` correctly refused it ("may need a size or
+colour chosen first"), and the user saw an item silently fail to add. Safe, and useless.
+
+Separately, such a result displays no pack count, so the user compared a price against
+an unknown quantity.
+
+Reasoning:
+
+- Amazon ships the whole variation map inline as
+  `"dimensionValuesDisplayData":{"<ASIN>":["Swagger","3.8 Ounce (Pack of 3)"],...}`.
+  Reading it is exact; clicking swatches to discover children would be guesswork.
+  Live-verified against four listings, which reported 2-4 real children each.
+- Resolving before adding turns a silent failure into a choice, and makes the thing
+  that arrives the thing that was picked.
+- The price is read from the child's page rather than inherited from the parent,
+  because a parent's "from $9.40" is not the price of the pack of six.
+
+Tradeoffs:
+
+- One extra page read per selection (~2s) and one extra turn, but only for listings
+  that genuinely have a choice to make: a single-variant listing is added directly.
+- A failed variant read falls back to adding what was picked, so a lookup problem
+  never blocks a selection.
+
+Consequences:
+
+- Every result line now states its pack count, or says "count not stated" when Amazon
+  did not, which is the cue that the product page will ask.
+- `ranking.pack_count()` still reads a count from a title; nothing reads one from the
+  query (ISSUE-034, closed WONTFIX at the user's direction).
+
+---
+
+## ADR-059 — Checkout Writes the Cart in One Step; the Order Screen Is a Labelled Mock
+
+Status: Accepted and implemented; refines ADR-026 and ADR-049
+
+Decision:
+
+"Check out" shows the summary and writes to the real Amazon cart in the same step.
+A "Place the order" option opens a screen shaped like Amazon's confirmation page whose
+first line reads `DEMO SCREEN — NO ORDER WAS PLACED`. Placing clears the list.
+
+Context:
+
+The user reviewed a list, chose "Check out", and was then asked to approve the same
+list again. The second gate reviewed nothing new. Separately, the "ordering is not
+implemented" copy appeared on every terminal screen and was asked to be removed.
+
+Reasoning:
+
+- The list *is* the review. A second approval of unchanged contents is friction, not
+  a control, and the cart is not an order — everything in it stays removable.
+- A visible destination screen makes the finished flow reviewable before any of it is
+  real. Shaping it like the real thing is the point; that is exactly why the banner
+  has to be the first thing read.
+- The ordering function in `checkout.py` is still called by nothing. The invariant
+  test was rewritten to assert no *call* rather than no mention, because the menu now
+  legitimately carries a `PLACE_ORDER` action.
+
+Tradeoffs:
+
+- An item reaches the real Amazon cart one tap earlier than before. This is a genuine
+  loosening of ADR-026's two-step gate, recorded deliberately rather than silently.
+- A screen that looks like a confirmation could mislead if the banner were ever
+  removed. It must not be.
+
+Consequences:
+
+- Both terminal screens are built from the whole Amazon cart, not the agent's list:
+  the order a user would place is every line in the cart, and showing only the agent's
+  two items understated a six-item cart.
+- Checking out twice is idempotent; a regression test asserts one cart write.
+
+---
+
+## ADR-060 — A Stored Menu Never Makes a Workflow Unreadable
+
+Status: Accepted and implemented; extends ADR-041
+
+Decision:
+
+`MenuOption.from_record()` returns `None` for an action the current code does not
+define, and those entries are dropped when a workflow is restored.
+
+Context:
+
+ADR-041 made workflow *fields* tolerant, but menu actions stayed strict:
+`MenuAction(record["action"])` raises `ValueError` on an unknown value. That happens
+inside `get_active_workflow()`, which runs on the first line of every message, so
+retiring any menu action would have broken every incoming message for any user
+holding a saved workflow. This session retired two actions, which is what surfaced it.
+
+Consequences:
+
+- Menu actions can now be renamed or removed without a migration.
+- The dropped option is simply absent; the menu is rebuilt on the next reply.

@@ -118,6 +118,11 @@ FORBIDDEN_CLAIMS = (
 # The disclaimer legitimately contains "added to your Amazon cart", so an affirmative
 # claim is only a failure when it is not being negated.
 AFFIRMATIVE_CART_CLAIM = re.compile(r"(?<!nothing has been )added it to your amazon cart")
+# The demo order screen deliberately mimics Amazon's confirmation page, so it contains
+# "your order is confirmed". That is only acceptable while the screen also states, in
+# its first line, that no order was placed — so the exemption is tied to that banner
+# rather than to the phrase.
+DEMO_BANNER = "no order was placed"
 
 
 def _check_reply(reply, message):
@@ -242,7 +247,7 @@ def test_no_sequence_of_replies_can_place_an_order(tmp_path, monkeypatch):
         asyncio.run(agent.agent_brain("checkout", *paths, user))
         reply = asyncio.run(agent.agent_brain(phrase, *paths, user))
 
-        assert "cannot place this order" in reply.casefold(), f"{phrase!r} -> {reply[:160]}"
+        assert "no order was placed" in reply.casefold(), f"{phrase!r} -> {reply[:160]}"
         workflow = workflow_store.get_workflow(user, paths[1])
         assert workflow.state not in {WorkflowState.PLACING_ORDER, WorkflowState.COMPLETED}
 
@@ -256,8 +261,17 @@ class AsyncSearch:
 
 
 def test_place_order_is_never_reachable_from_source():
+    """No module outside checkout.py may *call* place_order.
+
+    The name itself is now allowed: the menu carries a PLACE_ORDER action that opens a
+    mock-up of a completed order, clearly labelled as one. The function that would do
+    the real thing is still called by nothing.
+    """
+    import re
+
+    call = re.compile(r"checkout\.place_order|(?<![\w.])place_order\s*\(")
     source = Path(__file__).resolve().parent.parent / "src"
     for path in source.glob("*.py"):
         if path.name == "checkout.py":
             continue
-        assert "place_order" not in path.read_text(), f"{path.name} references place_order"
+        assert not call.search(path.read_text()), f"{path.name} calls place_order"

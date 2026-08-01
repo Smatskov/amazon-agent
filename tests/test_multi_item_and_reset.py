@@ -68,15 +68,14 @@ def test_confirming_sends_every_item_to_the_real_amazon_cart(paths, monkeypatch)
 
     monkeypatch.setattr(agent.amazon, "add_many_to_cart", add_many)
 
-    _run("checkout", paths)
-    reply = _run("confirm", paths)
+    reply = _run("checkout", paths)
 
     assert len(sent["items"]) == 3
     assert {url for url, _ in sent["items"]} == {
         "https://www.amazon.com/dp/h1", "https://www.amazon.com/dp/p1", "https://www.amazon.com/dp/b1",
     }
-    assert "Added 3 of 3 item(s) to your real Amazon cart." in reply
-    assert "I cannot place this order" in reply
+    assert "ADDED FROM YOUR LIST" in reply and "3 of 3 item(s)" in reply
+    assert "IN YOUR AMAZON CART" in reply
 
 
 
@@ -93,10 +92,9 @@ def test_a_partial_cart_failure_is_reported_honestly(paths, monkeypatch):
 
     monkeypatch.setattr(agent.amazon, "add_many_to_cart", add_many)
 
-    _run("checkout", paths)
-    reply = _run("confirm", paths)
+    reply = _run("checkout", paths)
 
-    assert "Added 2 of 3 item(s)" in reply
+    assert "2 of 3 item(s)" in reply
     assert "Not added" in reply
     assert "out of stock" in reply
 
@@ -108,12 +106,11 @@ def test_a_total_cart_failure_never_claims_success(paths, monkeypatch):
         AsyncMock(side_effect=amazon.AmazonCartUnavailable("profile locked")),
     )
 
-    _run("checkout", paths)
-    reply = _run("confirm", paths)
+    reply = _run("checkout", paths)
 
     assert "could not add these to your Amazon cart" in reply
     assert "Added 3" not in reply
-    assert "I cannot place this order" in reply
+    assert "IN YOUR AMAZON CART" in reply
 
 
 def test_confirming_never_reaches_an_ordering_state(paths, monkeypatch):
@@ -124,7 +121,6 @@ def test_confirming_never_reaches_an_ordering_state(paths, monkeypatch):
     )
 
     _run("checkout", paths)
-    _run("confirm", paths)
 
     workflow = workflow_store.get_workflow(USER, paths[1])
     assert workflow.state not in {WorkflowState.PLACING_ORDER, WorkflowState.COMPLETED}

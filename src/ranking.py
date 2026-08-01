@@ -119,9 +119,45 @@ def requested_sort(message: str) -> SortPreference:
     return SortPreference.RELEVANCE
 
 
+def default_sort(message: str) -> SortPreference:
+    """The ordering to use when the user stated no preference.
+
+    Amazon's own order leads with placements and promoted listings, so presenting it
+    unchanged meant the first numbered option was regularly the least useful one on the
+    page. Once results are relevance-filtered, cheapest-first is both predictable and
+    the thing a shopper is usually comparing. An explicit request still wins.
+    """
+    stated = requested_sort(message)
+    return SortPreference.PRICE if stated is SortPreference.RELEVANCE else stated
+
+
 MAX_PRICE_PHRASE = re.compile(
-    r"(?:under|below|less than|cheaper than|max|no more than|<)\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+    r"(?:under|below|less than|cheaper than|max|no more than|up to|<)\s*\$?\s*(\d+(?:\.\d{1,2})?)",
     re.IGNORECASE,
+)
+MIN_PRICE_PHRASE = re.compile(
+    r"(?:over|above|more than|at least|min|no less than|starting at|>)\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+    re.IGNORECASE,
+)
+# A range, which the budget parser previously could not see at all. "between 10 and 20
+# dollars" matched no max-price phrase, so "between" and "dollars" survived as leftover
+# words and became a keyword the title had to contain — filtering everything out.
+# Each alternative requires its own evidence that a price is meant: the word "between"
+# or "from", a dollar sign, or a trailing currency word.
+PRICE_RANGE_PHRASES = (
+    re.compile(
+        r"\b(?:between|from)\s*\$?\s*(\d+(?:\.\d{1,2})?)\s*(?:to|and|through|[-–—])\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\$\s*(\d+(?:\.\d{1,2})?)\s*(?:to|and|through|[-–—])\s*\$?\s*(\d+(?:\.\d{1,2})?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(\d+(?:\.\d{1,2})?)\s*(?:to|and|through|[-–—])\s*(\d+(?:\.\d{1,2})?)\s*"
+        r"(?:dollars?|bucks?|usd)\b",
+        re.IGNORECASE,
+    ),
 )
 MIN_RATING_PHRASE = re.compile(
     r"(?:rated|rating|stars?)\D{0,12}(\d(?:\.\d)?)|(\d(?:\.\d)?)\s*stars?\s*(?:or\s*(?:more|up|better|above))?",
@@ -130,22 +166,47 @@ MIN_RATING_PHRASE = re.compile(
 PRIME_PHRASE = re.compile(r"\bprime\b", re.IGNORECASE)
 CONSTRAINT_NOISE = frozenset(
     """only just the a an and or with under below less than more over cheaper max show me
-    ones one option options please product products that is are be by for""".split()
+    ones one option options please product products that is are be by for
+    dont don't want need looking""".split()
+)
+# Words that describe money. They are noise *only* when a price was actually parsed
+# out of the message: "between 10 and 20 dollars" leaves "between" and "dollars"
+# behind, and treating them as a keyword excluded every product. But "Dollar Shave
+# Club" and "Two Buck Chuck" are real things to search for, so these words are never
+# discarded when no price constraint was found.
+MONEY_WORDS = frozenset(
+    """between from through dollars dollar bucks buck usd price prices cost costs
+    budget range around about spend pay paying""".split()
 )
 
 
 def parse_constraint(message: str) -> dict:
     """Read a narrowing instruction deterministically.
 
-    "under $20", "only prime", "4 stars or more", or a bare brand word. Anything left
-    over becomes a keyword the title must contain, which is how a brand narrows.
+    "under $20", "between 10 and 20 dollars", "only prime", "4 stars or more", or a
+    bare brand word. Anything left over becomes a keyword the title must contain,
+    which is how a brand narrows. Words that describe money rather than the product
+    are treated as noise, because a leftover "dollars" became a keyword no title
+    could satisfy.
     """
     constraints: dict = {}
     lowered = (message or "").casefold()
+    consumed = lowered
 
-    price = MAX_PRICE_PHRASE.search(lowered)
-    if price:
-        constraints["max_price"] = float(price.group(1))
+    low, high, matched = _price_range(lowered)
+    if matched is not None:
+        constraints["min_price"] = low
+        constraints["max_price"] = high
+        consumed = consumed.replace(matched, " ")
+    else:
+        price = MAX_PRICE_PHRASE.search(lowered)
+        if price:
+            constraints["max_price"] = float(price.group(1))
+        floor = MIN_PRICE_PHRASE.search(lowered)
+        if floor:
+            constraints["min_price"] = float(floor.group(1))
+        consumed = MIN_PRICE_PHRASE.sub(" ", MAX_PRICE_PHRASE.sub(" ", consumed))
+
     if PRIME_PHRASE.search(lowered):
         constraints["prime"] = True
     rating = MIN_RATING_PHRASE.search(lowered)
@@ -154,16 +215,142 @@ def parse_constraint(message: str) -> dict:
         if value and 0 < float(value) <= 5:
             constraints["min_rating"] = float(value)
 
-    consumed = MAX_PRICE_PHRASE.sub(" ", lowered)
     consumed = PRIME_PHRASE.sub(" ", consumed)
+    # Money words are only noise once a price has actually been read out of the
+    # message; otherwise "dollar shave club" would lose the word that names it.
+    found_a_price = "min_price" in constraints or "max_price" in constraints
+    noise = CONSTRAINT_NOISE | MONEY_WORDS if found_a_price else CONSTRAINT_NOISE
     words = [
         word
         for word in re.findall(r"[a-z0-9'&-]{3,}", consumed)
-        if word not in CONSTRAINT_NOISE and not word.isdigit()
+        if word not in noise and not word.isdigit()
     ]
     if words:
         constraints["keyword"] = " ".join(words)
     return constraints
+
+
+def _price_range(lowered: str) -> tuple[float | None, float | None, str | None]:
+    """Read "between X and Y" in any of its written forms, lower bound first."""
+    for pattern in PRICE_RANGE_PHRASES:
+        match = pattern.search(lowered)
+        if match:
+            first, second = float(match.group(1)), float(match.group(2))
+            return min(first, second), max(first, second), match.group(0)
+    return None, None, None
+
+
+# Words that describe how the search was phrased rather than what is wanted.
+QUERY_NOISE = frozenset(
+    """the and for with new some any that this get buy need want order find search show
+    looking pack count size pcs please just now can you like from""".split()
+)
+
+
+def significant_tokens(text: str) -> set[str]:
+    """Fold text to comparable words.
+
+    Splits on anything that is not a letter or digit, so "Oral-B" and "oral b" agree
+    and punctuation the user omits cannot change the result. A run like "10mg" is also
+    emitted as "10" and "mg" so it matches a title written "10 mg".
+    """
+    tokens: set[str] = set()
+    for raw in re.findall(r"[a-z0-9]+", (text or "").casefold()):
+        for part in {raw, *re.findall(r"\d+|[a-z]+", raw)}:
+            if len(part) >= 3 or part.isdigit():
+                tokens.add(_fold(part.replace("'", "")))
+    return tokens
+
+
+def _close_enough(word: str, vocabulary: set[str]) -> bool:
+    """Exact match, or a single typo in a word long enough for that to be safe.
+
+    Short words are compared exactly: at four characters or fewer a single edit is as
+    likely to be a different word as a misspelling of this one.
+    """
+    if word in vocabulary:
+        return True
+    if len(word) < 5:
+        return False
+    return any(
+        abs(len(word) - len(other)) <= 1 and _within_one_edit(word, other)
+        for other in vocabulary
+    )
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    """True when one substitution, insertion, or deletion turns a into b."""
+    if a == b:
+        return True
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    for index in range(len(longer)):
+        if longer[:index] + longer[index + 1:] == shorter:
+            return True
+    return False
+
+
+def _token_alternatives(text: str) -> list[set[str]]:
+    """Group each written word with the forms it could legitimately take.
+
+    "10mg" is one word the user typed but two things a title may say, so it becomes
+    the group {"10mg", "10"} and is satisfied by either. Grouping matters: requiring
+    every form would make "10mg" fail against a title that writes "10 mg".
+    """
+    groups: list[set[str]] = []
+    for raw in re.findall(r"[a-z0-9]+", (text or "").casefold()):
+        forms = {
+            _fold(part.replace("'", ""))
+            for part in {raw, *re.findall(r"\d+|[a-z]+", raw)}
+            if len(part) >= 3 or part.isdigit()
+        }
+        if forms:
+            groups.append(forms)
+    return groups
+
+
+def matches_keyword(title: str, keyword: str) -> bool:
+    """Every word of a narrowing phrase must be present, allowing for typos.
+
+    "Nature's Bounty" narrowed against "Nature Made" must fail: requiring all words
+    means the shared word "nature" is not enough, which is what stops a narrowing from
+    quietly returning a different brand.
+    """
+    groups = _token_alternatives(keyword)
+    if not groups:
+        return True
+    present = significant_tokens(title)
+    return all(
+        any(_close_enough(form, present) for form in group) for group in groups
+    )
+
+
+def relevance(candidates: list[Candidate], query: str) -> FilterOutcome:
+    """Drop results that share no meaningful word with what was asked for.
+
+    Amazon mixes placements into organic results that carry a real ASIN, a real price,
+    and no sponsored marker of any kind -- a "One Medical Membership, $99.00" appeared
+    among melatonin results and was selectable as option 1. Marker-based ad detection
+    was verified live to be useless here (the genuine products carried the sponsored
+    marker and the placement did not), so relevance to the query is the only honest
+    discriminator available.
+    """
+    wanted = {word for word in significant_tokens(query) if word not in QUERY_NOISE}
+    if not wanted:
+        return FilterOutcome(list(candidates), 0)
+
+    kept = [
+        candidate
+        for candidate in candidates
+        if significant_tokens(candidate.title) & wanted
+    ]
+    removed = len(candidates) - len(kept)
+    # Nothing sharing a single word with the request means the query itself was not
+    # understood as a product. Showing the results anyway produced "A Smell of Honey,
+    # $19.99" for "6 dont want to pay over 10 bucks" — a real listing, and garbage as
+    # an answer. Reporting nothing lets the caller say so plainly instead.
+    return FilterOutcome(kept, removed, ("unrelated to your search",) if removed else ())
 
 
 def apply_constraints(
@@ -174,24 +361,24 @@ def apply_constraints(
         return FilterOutcome(list(candidates), 0)
 
     max_price = _number(constraints.get("max_price"))
+    min_price = _number(constraints.get("min_price"))
     min_rating = _number(constraints.get("min_rating"))
     prime_required = constraints.get("prime") is True or constraints.get("prime_required") is True
     keyword = constraints.get("keyword")
-    keyword_words = (
-        [word for word in str(keyword).casefold().split() if word] if keyword else []
-    )
 
     kept: list[Candidate] = []
     reasons: list[str] = []
     for candidate in candidates:
-        if keyword_words:
-            title = candidate.title.casefold()
-            if not any(word in title for word in keyword_words):
+        if keyword:
+            if not matches_keyword(candidate.title, str(keyword)):
                 _add(reasons, f"not matching '{keyword}'")
                 continue
         # A missing fact is not a violation; it cannot prove the constraint is broken.
         if max_price is not None and candidate.price is not None and candidate.price > max_price:
             _add(reasons, f"over ${max_price:g}")
+            continue
+        if min_price is not None and candidate.price is not None and candidate.price < min_price:
+            _add(reasons, f"under ${min_price:g}")
             continue
         if min_rating is not None and candidate.rating is not None and candidate.rating < min_rating:
             _add(reasons, f"rated under {min_rating:g}")
@@ -263,95 +450,13 @@ def _rank_by_rating(candidates: list[Candidate]) -> RankedCandidates:
     return RankedCandidates(ordered + unrated, "customer rating", caveat)
 
 
-@dataclass(frozen=True, slots=True)
-class Recommendation:
-    """One pick, with the evidence that chose it stated in plain words."""
-
-    candidate: Candidate
-    reasons: tuple[str, ...]
-    runner_up: Candidate | None = None
-
-
-def _accuracy(candidate: Candidate, request_terms: set[str]) -> float:
-    """Share of the user's own words that appear in the title."""
-    if not request_terms:
-        return 0.0
-    title_words = {_fold(word) for word in re.findall(r"[a-z0-9]+", candidate.title.casefold())}
-    matched = sum(1 for term in request_terms if _fold(term) in title_words)
-    return matched / len(request_terms)
-
-
 def _fold(word: str) -> str:
+    """Fold a simple plural so "tablets" and "tablet" compare equal."""
     if word.endswith(("ses", "xes", "zes", "ches", "shes")):
         return word[:-2]
     if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
         return word[:-1]
     return word
-
-
-def recommend(candidates: list[Candidate], request: str) -> Recommendation | None:
-    """Pick the single best candidate on request accuracy, price, and delivery speed.
-
-    Weighted deliberately: matching what the user asked for outranks being cheap,
-    because the cheapest wrong product is not a good answer. Every component is a fact
-    Amazon supplied; a missing fact scores neutral rather than being invented.
-    """
-    if not candidates:
-        return None
-
-    terms = {
-        word
-        for word in re.findall(r"[a-z0-9]+", request.casefold())
-        if len(word) > 2 and word not in _REQUEST_NOISE
-    }
-    unit_prices = [p for p in (unit_price(c) or c.price for c in candidates) if p is not None]
-    cheapest, dearest = (min(unit_prices), max(unit_prices)) if unit_prices else (None, None)
-    day_values = [d for d in (delivery_days(c.delivery_label) for c in candidates) if d is not None]
-    soonest, latest = (min(day_values), max(day_values)) if day_values else (None, None)
-
-    scored: list[tuple[float, Candidate, tuple[str, ...]]] = []
-    for candidate in candidates:
-        reasons: list[str] = []
-        accuracy = _accuracy(candidate, terms)
-        if accuracy >= 0.99 and terms:
-            reasons.append("matches everything you asked for")
-
-        effective = unit_price(candidate) or candidate.price
-        price_score = 0.5
-        if effective is not None and cheapest is not None and dearest is not None and dearest > cheapest:
-            price_score = 1 - (effective - cheapest) / (dearest - cheapest)
-            if effective == cheapest:
-                reasons.append("lowest price per item" if unit_price(candidate) else "lowest price")
-
-        days = delivery_days(candidate.delivery_label)
-        speed_score = 0.5
-        if days is not None and soonest is not None and latest is not None and latest > soonest:
-            speed_score = 1 - (days - soonest) / (latest - soonest)
-            if days == soonest:
-                reasons.append(f"arrives soonest ({candidate.delivery_label})")
-        elif days is not None:
-            reasons.append(f"arrives {candidate.delivery_label}")
-
-        rating_score = (candidate.rating or 0) / 5
-        total = 0.45 * accuracy + 0.25 * price_score + 0.20 * speed_score + 0.10 * rating_score
-        if candidate.rating is not None and candidate.rating >= 4.5:
-            reasons.append(f"rated {candidate.rating:g}/5")
-        scored.append((total, candidate, tuple(reasons)))
-
-    scored.sort(key=lambda row: -row[0])
-    best = scored[0]
-    return Recommendation(
-        candidate=best[1],
-        reasons=best[2] or ("closest match to your request",),
-        runner_up=scored[1][1] if len(scored) > 1 else None,
-    )
-
-
-# Words that describe the act of asking, not the product being asked for.
-_REQUEST_NOISE = frozenset(
-    """add buy get find need want order please cart list the and for from with some any
-    just now can you could would like me my mine another one two get""".split()
-)
 
 
 def _number(value) -> float | None:

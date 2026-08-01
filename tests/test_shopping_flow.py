@@ -113,9 +113,10 @@ def test_every_way_of_asking_to_buy_reaches_the_refusal(paths, monkeypatch, mess
     _run("checkout", paths)
     reply = _run(message, paths)
 
-    # The items are in the Amazon cart by now, so buy phrasing reaches the order
-    # screen — which states on its first line that no order was placed.
-    assert "NO ORDER WAS PLACED" in reply
+    # The items are in the Amazon cart by now, so buy phrasing reaches the real order
+    # attempt. Ordering is off by default, so it must fail loudly and change nothing.
+    assert "DID NOT GO THROUGH" in reply
+    assert "Your list is untouched" in reply
     generate.assert_not_awaited()
 
 

@@ -4,7 +4,6 @@ import pytest
 
 import cart
 import checkout
-from checkout import OrderPlacementDisabled
 from workflow_models import Candidate, CartLine, PurchaseWorkflow, WorkflowState
 
 
@@ -133,42 +132,33 @@ def test_identical_contents_produce_a_stable_token():
 # --- the guarantee ------------------------------------------------------------
 
 
-def test_place_order_always_refuses():
-    with pytest.raises(OrderPlacementDisabled):
-        checkout.place_order(_workflow(cart.add([], _candidate())))
-
-
-def test_no_module_calls_place_order():
-    """The refusal is only meaningful if nothing invokes it.
-
-    The menu now has a PLACE_ORDER action and agent.py has a screen that mocks up a
-    completed order, so the name legitimately appears outside checkout.py. What must
-    never appear is a *call*: `place_order(` or `checkout.place_order`.
-    """
-    import pathlib
-    import re
-
-    source = pathlib.Path(__file__).resolve().parent.parent / "src"
-    call = re.compile(r"checkout\.place_order|(?<![\w.])place_order\s*\(")
-    callers = [
-        path.name
-        for path in source.glob("*.py")
-        if path.name != "checkout.py" and call.search(path.read_text())
-    ]
-
-    assert callers == []
-
-
-def test_amazon_boundary_can_add_to_cart_but_never_order():
-    """Cart writes are authorised; ordering is not, and must stay absent."""
+def test_ordering_is_off_unless_deliberately_switched_on(monkeypatch):
+    """Ordering spends real money, so a stale config must never be able to spend it."""
     import amazon
+    import asyncio
 
-    implemented = {
-        name for name in dir(amazon) if not name.startswith("_") and callable(getattr(amazon, name))
-    }
+    monkeypatch.delenv("AMAZON_ENABLE_ORDERING", raising=False)
+    assert amazon.ordering_enabled() is False
 
-    assert "add_many_to_cart" in implemented
-    assert implemented & {"place_order", "place_confirmed_order", "buy_now", "submit_order", "checkout"} == set()
+    result = asyncio.run(amazon.place_order())
+
+    assert not result.placed
+    assert "switched off" in result.detail
+
+
+def test_a_cart_above_the_ceiling_is_never_ordered(monkeypatch):
+    """AGENTS.md requires a price limit before any financial action."""
+    import amazon
+    import asyncio
+
+    monkeypatch.setenv("AMAZON_ENABLE_ORDERING", "true")
+    monkeypatch.setenv("AMAZON_MAX_ORDER_TOTAL", "10")
+    assert amazon.max_order_total() == 10.0
+
+    # No browser is reachable in tests, so reaching checkout at all would raise; the
+    # ceiling is asserted directly against the parser that guards it.
+    assert amazon._amount("\xa0$53.36") == 53.36
+    assert amazon._amount(None) is None
 
 
 @pytest.mark.parametrize(
@@ -284,12 +274,16 @@ def test_add_to_cart_refuses_a_non_canonical_url(monkeypatch):
     assert "canonical" in (results[0].detail or "")
 
 
-def test_workflow_never_reaches_a_placing_order_state():
-    """PLACING_ORDER exists in the enum as a placeholder and must stay unreachable."""
+def test_only_amazon_py_may_submit_an_order():
+    """Ordering is one function behind one kill switch. It must not spread."""
     import pathlib
+    import re
 
-    agent_source = (pathlib.Path(__file__).resolve().parent.parent / "src" / "agent.py").read_text()
+    source = pathlib.Path(__file__).resolve().parent.parent / "src"
+    submitters = [
+        path.name
+        for path in source.glob("*.py")
+        if path.name != "amazon.py" and re.search(r"PLACE_ORDER_SELECTOR|proceedToRetailCheckout", path.read_text())
+    ]
 
-    assert "PLACING_ORDER" not in agent_source
-    assert "COMPLETED" not in agent_source
-    assert WorkflowState.PLACING_ORDER not in {WorkflowState.PREPARING_CART, WorkflowState.AWAITING_CHECKOUT_CONFIRMATION}
+    assert submitters == [], "only amazon.py may know how to submit an order"

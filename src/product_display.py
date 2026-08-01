@@ -378,30 +378,62 @@ def present_ready_to_order(
 
 
 def present_order_placed(
-    summary, options: list[MenuOption], amazon_cart: list | None = None, destination=None
+    summary, options: list[MenuOption], amazon_cart: list | None = None, destination=None,
+    order_id: str | None = None, order_url: str | None = None,
 ) -> str:
-    """A stand-in for Amazon's confirmation page.
-
-    The banner is not decoration. This screen is deliberately shaped like the real
-    thing, so the one fact that makes it not the real thing has to be the first thing
-    read: no order exists, and nothing has been charged.
-
-    Every line in the cart is listed, not only the ones added here — an order would
-    have bought all of them.
-    """
+    """Amazon accepted the order. Everything here is a fact Amazon returned."""
     blocks, total, count = _cart_blocks(amazon_cart or [])
     if not blocks:
         total = "unknown" if summary.subtotal is None else f"${summary.subtotal:.2f}"
         count = summary.item_count
         blocks = ["\n".join(_cart_line(i, line) for i, line in enumerate(summary.lines, 1))]
 
+    reference = f"\n<b>Order number:</b> <code>{text(order_id)}</code>" if order_id else ""
+    link = (
+        f'\n<a href="{text(order_url)}">Open this order on Amazon</a>'
+        if order_url else ""
+    )
     return "\n\n".join(block for block in [
-        "🚧 <b>DEMO SCREEN — NO ORDER WAS PLACED</b>\n"
-        "<i>Order placement is switched off. Nothing has been bought or charged. "
-        "Your items are still sitting in your Amazon cart.</i>",
-        f"✅ <b>THANK YOU, YOUR ORDER IS CONFIRMED</b> — {count} item(s)",
+        f"✅ <b>ORDER PLACED</b> — {count} item(s), {total}{reference}{link}",
         *blocks,
         _destination_block(destination),
-        f"<b>Order total:</b> {total} <i>(items only)</i>",
+        "<i>Your list has been cleared because the order went through.</i>",
+        menu.render(options, heading="What next?"),
+    ] if block)
+
+
+def present_order_failed(
+    summary, options: list[MenuOption], detail: str | None, *,
+    needs_sign_in: bool = False, declined: bool = False,
+) -> str:
+    """The order did not happen, and the list is untouched.
+
+    The headline names the cause, because "something went wrong" gives the user
+    nothing to act on. The list is stated as intact so nobody re-adds items they
+    still have.
+    """
+    if declined:
+        headline = "❌ <b>PAYMENT DECLINED — NOTHING WAS ORDERED</b>"
+        guidance = (
+            "Amazon would not accept the card on file. Update your payment method on "
+            "Amazon, then come back and check out again."
+        )
+    elif needs_sign_in:
+        headline = "🔒 <b>AMAZON WANTS YOU TO SIGN IN — NOTHING WAS ORDERED</b>"
+        guidance = (
+            "Amazon asks for your password again before accepting an order. I never "
+            "enter passwords, so this one is yours to do: sign in on Amazon, then "
+            "check out again here within a few minutes."
+        )
+    else:
+        headline = "❌ <b>THE ORDER DID NOT GO THROUGH</b>"
+        guidance = "Nothing was bought and nothing was charged."
+
+    return "\n\n".join(block for block in [
+        headline,
+        f"<i>{text(detail)}</i>" if detail else "",
+        guidance,
+        "<b>Your list is untouched</b> — the items are still here and still in your "
+        "Amazon cart. Nothing was removed.",
         menu.render(options, heading="What next?"),
     ] if block)

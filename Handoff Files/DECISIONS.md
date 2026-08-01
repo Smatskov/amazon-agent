@@ -1943,3 +1943,86 @@ Consequences:
 
 - Menu actions can now be renamed or removed without a migration.
 - The dropped option is simply absent; the menu is rebuilt on the next reply.
+
+---
+
+## ADR-061 — Ordering Is Implemented, Behind a Kill Switch, a Ceiling, and an Audit Log
+
+Status: Accepted and implemented; supersedes ADR-049 and completes ADR-010 stage 6
+
+Decision:
+
+`amazon.place_order()` submits a real Amazon order. It is the only function that knows
+how to do so, and it refuses unless every one of these holds:
+
+- `AMAZON_ENABLE_ORDERING` is exactly `true`.
+- The cart total is readable and at or under `AMAZON_MAX_ORDER_TOTAL`.
+- The order total Amazon states on its own review page is also at or under that
+  ceiling — checked separately, because a total that grew between the two reads is a
+  reason to stop, not to pay.
+
+Every attempt is appended to an audit log. `checkout.place_order()` and
+`OrderPlacementDisabled` are removed: ordering exists now, so a function whose only
+job was to refuse is no longer the truth.
+
+Context:
+
+ADR-049 refused ordering because it was not implemented and a false confirmation was
+the worst thing the agent could produce. The user has since asked for real ordering,
+which is ADR-010's stage 6 and the project's stated goal. `AGENTS.md` requires price
+limits, audit logs, and confirmation rules before any financial action, so those are
+built with it rather than after it.
+
+Reasoning:
+
+- The ready-to-order screen already shows the whole cart, the total, the address and
+  the card. That is ADR-026's reviewable pause, so the gate is satisfied by connecting
+  it to a real action rather than by adding another approval.
+- A kill switch that defaults to off means the dangerous path cannot be reached by
+  accident — by a stale `.env`, a copied config, or a test.
+- Checking the ceiling twice matters because the two numbers come from different pages
+  at different times. Trusting the first would let a shipping charge or a price change
+  push an order past a limit the user set.
+- Amazon requires a fresh sign-in before checkout (`max_auth_age=900`, verified live).
+  This application never authenticates, so that is surfaced as the user's step. It is
+  not a bug to route around; it is Amazon's control and it stays.
+
+Tradeoffs:
+
+- The agent can now spend money. That is the point, and it is why the controls above
+  are structural rather than advisory.
+- Ordering cannot succeed unless the user has signed in to Amazon recently, so the
+  sign-in failure is the common path rather than an edge case.
+
+Consequences:
+
+- A test asserts that only `amazon.py` contains the checkout selectors, so ordering
+  cannot spread across modules.
+- The fuzz suite asserts the kill switch is the only thing between a menu tap and a
+  purchase, and that it reads strictly.
+
+---
+
+## ADR-062 — A Failed Order Changes Nothing; a Placed Order Clears Everything
+
+Status: Accepted and implemented
+
+Decision:
+
+The two outcomes are deliberately asymmetric. A placed order clears the list and
+offers one choice: start shopping again. A failed order transitions nothing, clears
+nothing, and offers view / add / remove / start-over — with the last labelled as the
+only thing that clears the list.
+
+Reasoning:
+
+- Items that were bought must leave the list, or the next session invites ordering
+  them a second time.
+- Items that were *not* bought must stay, or a declined card costs the user the whole
+  basket they had assembled. Recovery should be fixing the card, not rebuilding the
+  list.
+- The failure headline names the cause — declined, sign-in required, or unknown —
+  because "something went wrong" gives the user nothing to act on.
+- An unconfirmed outcome is reported as unknown, never as success. Amazon not showing
+  a confirmation page is not the same as an order failing, and the user is told to
+  check their orders rather than being told either story.

@@ -247,7 +247,7 @@ def test_no_sequence_of_replies_can_place_an_order(tmp_path, monkeypatch):
         asyncio.run(agent.agent_brain("checkout", *paths, user))
         reply = asyncio.run(agent.agent_brain(phrase, *paths, user))
 
-        assert "no order was placed" in reply.casefold(), f"{phrase!r} -> {reply[:160]}"
+        assert "did not go through" in reply.casefold(), f"{phrase!r} -> {reply[:160]}"
         workflow = workflow_store.get_workflow(user, paths[1])
         assert workflow.state not in {WorkflowState.PLACING_ORDER, WorkflowState.COMPLETED}
 
@@ -259,19 +259,14 @@ class AsyncSearch:
     async def __call__(self, query):
         return list(self.products)
 
+def test_ordering_cannot_fire_without_the_kill_switch(monkeypatch):
+    """The only thing standing between a menu tap and real money is this flag."""
+    import amazon
 
-def test_place_order_is_never_reachable_from_source():
-    """No module outside checkout.py may *call* place_order.
-
-    The name itself is now allowed: the menu carries a PLACE_ORDER action that opens a
-    mock-up of a completed order, clearly labelled as one. The function that would do
-    the real thing is still called by nothing.
-    """
-    import re
-
-    call = re.compile(r"checkout\.place_order|(?<![\w.])place_order\s*\(")
-    source = Path(__file__).resolve().parent.parent / "src"
-    for path in source.glob("*.py"):
-        if path.name == "checkout.py":
-            continue
-        assert not call.search(path.read_text()), f"{path.name} calls place_order"
+    monkeypatch.delenv("AMAZON_ENABLE_ORDERING", raising=False)
+    assert amazon.ordering_enabled() is False
+    monkeypatch.setenv("AMAZON_ENABLE_ORDERING", "TRUE")
+    assert amazon.ordering_enabled() is True
+    for value in ("", "1", "yes", "false", "no", " true "):
+        monkeypatch.setenv("AMAZON_ENABLE_ORDERING", value)
+        assert amazon.ordering_enabled() is (value.strip().casefold() == "true")

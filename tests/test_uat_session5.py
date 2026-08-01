@@ -542,11 +542,10 @@ def test_a_cart_read_failure_never_breaks_the_confirmation(paths, monkeypatch):
     monkeypatch.setattr(agent.amazon, "read_cart", AsyncMock(side_effect=RuntimeError("offline")))
 
     _run("toothbrush", paths)
-    _run("1", paths)
-    _run("1", paths)
-    reply = _run("1", paths)
+    _run("1", paths)          # add
+    reply = _run("1", paths)  # check out — this is what the failing read must not break
 
-    assert "NO ORDER WAS PLACED" in reply
+    assert "IN YOUR AMAZON CART" in reply
 
 
 def test_the_remove_menu_shows_what_each_item_costs(paths, monkeypatch):
@@ -662,3 +661,106 @@ def test_quantity_can_be_changed_again(paths, monkeypatch):
     assert workflow.cart[0].quantity == 3
     assert workflow.confirmed_token is None, "a changed quantity invalidates approval"
     assert "3" in reply
+
+
+# --------------------------------------------------------------------------
+# Placing a real order: the two outcomes, and the controls in front of them
+# --------------------------------------------------------------------------
+
+def _at_the_order_screen(paths, monkeypatch):
+    """Drive to the screen where "1" is Place the order."""
+    monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_toothbrushes()))
+    monkeypatch.setattr(agent.amazon, "read_variants", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        agent.amazon, "add_many_to_cart",
+        AsyncMock(return_value=[amazon.CartWriteResult("https://www.amazon.com/dp/B00CC6XSSQ", 1, True)]),
+    )
+    monkeypatch.setattr(agent.amazon, "read_cart", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent.amazon, "read_destination",
+                        AsyncMock(return_value=amazon.Destination("tanay Tx 75160", "Visa ending 6250")))
+    _run("toothbrush", paths)
+    _run("1", paths)   # add
+    _run("1", paths)   # check out
+
+
+def test_a_placed_order_reports_the_order_number_and_clears_the_list(paths, monkeypatch):
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        True, order_id="112-3456789-1234567",
+        order_url="https://www.amazon.com/gp/css/order-history")))
+
+    reply = _run("1", paths)
+
+    assert "ORDER PLACED" in reply
+    assert "112-3456789-1234567" in reply
+    assert "order-history" in reply
+    workflow = workflow_store.get_active_workflow(USER, paths[1])
+    assert workflow is None or workflow.cart == [], "a placed order clears the list"
+
+
+def test_a_declined_card_says_so_and_keeps_the_list(paths, monkeypatch):
+    """The list must survive so the user can fix the card and try again."""
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        False, declined=True, detail="Amazon rejected the payment method. Nothing was ordered.")))
+
+    reply = _run("1", paths)
+
+    assert "PAYMENT DECLINED" in reply
+    assert "Your list is untouched" in reply
+    assert "Update your payment method" in reply
+    assert len(workflow_store.get_workflow(USER, paths[1]).cart) == 1
+
+
+def test_the_sign_in_wall_is_reported_as_the_users_step(paths, monkeypatch):
+    """Live-verified: Amazon redirects checkout to /ap/signin with max_auth_age=900.
+    The agent never authenticates, so this is handed back rather than worked around."""
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        False, needs_sign_in=True,
+        detail="Amazon wants you to sign in again before it will accept an order.")))
+
+    reply = _run("1", paths)
+
+    assert "SIGN IN" in reply
+    assert "never enter passwords" in reply
+    assert "Your list is untouched" in reply
+    assert len(workflow_store.get_workflow(USER, paths[1]).cart) == 1
+
+
+def test_a_failed_order_offers_exactly_the_four_recovery_choices(paths, monkeypatch):
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order",
+                        AsyncMock(return_value=amazon.OrderResult(False, detail="something broke")))
+
+    _run("1", paths)
+
+    actions = [o.action for o in workflow_store.get_workflow(USER, paths[1]).pending_menu]
+    assert actions == [MenuAction.VIEW_LIST, MenuAction.KEEP_SHOPPING,
+                       MenuAction.REMOVE, MenuAction.CANCEL]
+
+
+def test_a_placed_order_offers_only_shopping_again(paths, monkeypatch):
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order",
+                        AsyncMock(return_value=amazon.OrderResult(True, order_id="111-2222222-3333333")))
+
+    _run("1", paths)
+
+    workflow = workflow_store.get_workflow(USER, paths[1])
+    assert [o.action for o in workflow.pending_menu] == [MenuAction.KEEP_SHOPPING]
+
+
+def test_an_unconfirmed_outcome_is_never_reported_as_success(paths, monkeypatch):
+    """Amazon showing no confirmation is not the same as an order failing, and it is
+    certainly not success. It has to be said plainly so the user checks."""
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        False, detail="Amazon did not show a confirmation, so I cannot tell you the order "
+                      "went through. Check your Amazon orders before trying again.")))
+
+    reply = _run("1", paths)
+
+    assert "cannot tell you the order went through" in reply
+    assert "ORDER PLACED" not in reply
+    assert len(workflow_store.get_workflow(USER, paths[1]).cart) == 1

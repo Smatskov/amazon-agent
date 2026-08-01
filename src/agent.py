@@ -198,7 +198,7 @@ async def _execute_menu_choice(
     if action is MenuAction.CONFIRM:
         return await _confirm_order(workflow, workflow_database_path)
     if action is MenuAction.PLACE_ORDER:
-        return _order_placed_screen(workflow, workflow_database_path)
+        return await _place_order(workflow, workflow_database_path)
     if action is MenuAction.SELECT:
         candidate = next(
             (c for c in workflow.candidates if c.candidate_id == option.payload), None
@@ -288,7 +288,7 @@ async def _apply_workflow_reply(
         # request to check out again. Answering "say checkout first" here told the user
         # to redo something they had just done.
         if workflow.state == WorkflowState.PAUSED and workflow.cart:
-            return _order_placed_screen(workflow, workflow_database_path)
+            return await _place_order(workflow, workflow_database_path)
         return await _confirm_order(workflow, workflow_database_path)
     if reply.intent is workflow_reply.ReplyIntent.CHECKOUT:
         return await _begin_checkout(workflow, workflow_database_path)
@@ -685,26 +685,34 @@ async def _confirm_order(
     )
 
 
-def _order_placed_screen(
+async def _place_order(
     workflow: PurchaseWorkflow, workflow_database_path: str | Path
 ) -> str:
-    """Show what a completed order would look like, without placing one.
+    """Submit the real Amazon order, and report exactly what happened.
 
-    The ordering function in checkout.py is still never called and still exists only
-    to raise. This
-    is a mock-up of the destination, labelled as one on its first line, so the shape of
-    the finished flow can be reviewed before any of it is real.
+    The two outcomes are deliberately asymmetric. A placed order clears the list,
+    because those items are bought and leaving them would invite ordering them twice.
+    A failed order changes nothing at all: the list survives, so the user can fix the
+    cause and try again without rebuilding what they had.
     """
     if not workflow.cart:
         return "There is nothing to order — your list is empty."
-    # Render from a snapshot taken before clearing: the screen has to show what was
-    # ordered, and everything after it has to behave as though the order happened.
+
     summary = checkout.summarize(workflow)
     ordered = list(workflow.amazon_cart)
     shipping = list(workflow.destination)
+    result = await amazon.place_order()
 
-    # An order ends the shopping session. Leaving the list populated meant the next
-    # screen still offered "View your list (2 items)" for items already ordered.
+    if not result.placed:
+        # Nothing is cleared and nothing is transitioned: the workflow is exactly as
+        # it was, so every option on the failure menu still acts on real items.
+        options = flow.store(workflow, flow.order_failed_menu(workflow))
+        workflow_store.save_workflow(workflow, workflow_database_path)
+        return product_display.present_order_failed(
+            summary, options, result.detail,
+            needs_sign_in=result.needs_sign_in, declined=result.declined,
+        )
+
     workflow.cart = []
     workflow.amazon_cart = []
     workflow.candidates = []
@@ -714,10 +722,12 @@ def _order_placed_screen(
     workflow.destination = []
     options = flow.store(workflow, flow.done_menu(workflow))
     workflow_store.transition(
-        workflow, WorkflowState.PAUSED, pending_question="Anything else?"
+        workflow, WorkflowState.COMPLETED, pending_question="Anything else?"
     )
     workflow_store.save_workflow(workflow, workflow_database_path)
-    return product_display.present_order_placed(summary, options, ordered, shipping)
+    return product_display.present_order_placed(
+        summary, options, ordered, shipping, result.order_id, result.order_url
+    )
 
 
 async def _push_to_amazon_cart(workflow: PurchaseWorkflow) -> str:

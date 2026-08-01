@@ -135,11 +135,23 @@ def ready_to_order_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
     ]
 
 
-def done_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
+def order_failed_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
+    """Offered when an order did not go through.
+
+    The list is deliberately still intact, so every option here acts on something that
+    still exists. Starting over is the only thing that clears it, and it says so.
+    """
     return [
-        MenuOption(MenuAction.KEEP_SHOPPING, "Shop for something else"),
-        MenuOption(MenuAction.CANCEL, "Start over"),
+        MenuOption(MenuAction.VIEW_LIST, "View your list"),
+        MenuOption(MenuAction.KEEP_SHOPPING, "Add another product"),
+        MenuOption(MenuAction.REMOVE, "Remove a product"),
+        MenuOption(MenuAction.CANCEL, "Start over — clears your list"),
     ]
+
+
+def done_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
+    """After a successful order the list is already empty, so there is one thing to do."""
+    return [MenuOption(MenuAction.KEEP_SHOPPING, "Start shopping again")]
 
 
 def store(workflow: PurchaseWorkflow, options: list[MenuOption]) -> list[MenuOption]:

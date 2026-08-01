@@ -2,17 +2,19 @@
 
 Last updated: 2026-08-01
 
-Status: The shopping conversation is menu-driven and entirely deterministic. Search → numbered results → pick → list → checkout summary → confirm → **items pushed to the real Amazon cart** → ordering refused.
+Status: The shopping conversation is menu-driven and entirely deterministic. Search → numbered results → pick a variant → list → check out (**writes the real Amazon cart**) → **Place the order (submits a real order)**.
 
-**No language model participates in shopping, and none can write anything the user sees** (ADR-051). **Ordering is not implemented and is unreachable** (ADR-049).
+**No language model participates in shopping, and none can write anything the user sees** (ADR-051). **Ordering is implemented** (ADR-061) and is off unless `AMAZON_ENABLE_ORDERING=true`, under a price ceiling, with an audit log.
 
-Decisions are append-only in `Handoff Files/DECISIONS.md` (ADR-001 through ADR-060). Live findings and open bugs are in `Handoff Files/OPEN_ISSUES.md`.
+**Ordering cannot succeed until you have signed in to Amazon recently.** Amazon requires a fresh sign-in before checkout (`max_auth_age=900`, verified live); the agent never authenticates and reports that redirect as your step.
+
+Decisions are append-only in `Handoff Files/DECISIONS.md` (ADR-001 through ADR-062). Live findings and open bugs are in `Handoff Files/OPEN_ISSUES.md`.
 
 ## What is verified, and what is not
 
 Verified in this session:
 
-- **607 tests pass** (`.venv/bin/python -m pytest -q`), including 58 regressions pinning every UAT session 5 and 6 failure, plus **11,000 fuzzed conversation turns** against a deliberately unreliable model.
+- **609 tests pass** (`.venv/bin/python -m pytest -q`), including 58 regressions pinning every UAT session 5 and 6 failure, plus **11,000 fuzzed conversation turns** against a deliberately unreliable model.
 - **Live against real Amazon, read-only** — the search pipeline was re-verified end to end after the fixes:
   - `oral b toothbrush 4 pack` returns five *distinguishable* titles (was five lines reading `Oral-B`).
   - `melatonin 10mg` drops the `One Medical Membership — $99.00` placement (`dropped as unrelated: 1`).
@@ -62,7 +64,7 @@ Step 9 is the inversion that fixed the last round of failures. Amazon's own sear
 | `workflow_store.py` | 107 | One workflow per user; `transition()` is the only state change. | 24-hour expiry (ADR-046). Does not reject illegal transitions. |
 | `flow.py` | 152 | Builds the menu for each point in the conversation (**new**). | Pure assembly. |
 | `main.py` | 131 | Telegram transport, authorization, HTML send with plain-text fallback. | Logs user id and message length only. Authorization fails closed. |
-| `checkout.py` | 95 | Order summary, confirmation fingerprint, refusal. | `place_order()` exists only to raise. |
+| `checkout.py` | 84 | Order summary and confirmation fingerprint. | Contacts nothing. Ordering lives in `amazon.py`. |
 | `menu.py` | 142 | Numbered choices and reading one back (**new**). | Escapes labels; product titles are untrusted text. |
 | `cart.py` | 78 | The user's chosen items as pure operations. | One unknown price makes the whole subtotal unknown. |
 | `memory.py` | 55 | Explicit key/value memory. | No preference inference. |
@@ -71,11 +73,11 @@ Deleted in this session, each existing only to let the model talk about products
 
 ## Test coverage
 
-**607 passing.** External boundaries are blocked in `tests/conftest.py`: no test can open a browser (`amazon.async_playwright`) or reach LM Studio (`llm_client.generate_response`), and default database paths are redirected so nothing writes to `data/`.
+**609 passing.** External boundaries are blocked in `tests/conftest.py`: no test can open a browser (`amazon.async_playwright`) or reach LM Studio (`llm_client.generate_response`), and default database paths are redirected so nothing writes to `data/`.
 
 | Test file | Tests | Covers |
 | --- | --- | --- |
-| `test_uat_session5.py` | 58 | **UAT session 5**: junk results, price ordering, brand-only titles, narrowing by brand, the stale-candidate hijack, menu lifetime, cart reconciliation. |
+| `test_uat_session5.py` | 64 | **UAT session 5**: junk results, price ordering, brand-only titles, narrowing by brand, the stale-candidate hijack, menu lifetime, cart reconciliation. |
 | `test_adversarial.py` | 237 | Hostile input, prompt injection in Amazon titles, money arithmetic, abused state transitions, boundary failures. |
 | `test_fuzz_conversations.py` | 42 | Whole conversations against an unreliable model, invariants after every turn. |
 | `test_workflow_reply.py` | 35 | Control words, buy phrasing, positions, and the mixed sentences that must defer. |

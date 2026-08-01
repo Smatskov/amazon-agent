@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from time import perf_counter
@@ -77,6 +78,37 @@ ORDERING_URL_FRAGMENTS = (
     "/gp/cart/desktop/go-to-checkout",
     "spc/handlers/display.html",
 )
+
+
+# Ordering spends real money, so it is off unless deliberately switched on. A stale
+# config, a forgotten test, or a copied .env cannot place an order by accident.
+def ordering_enabled() -> bool:
+    return os.getenv("AMAZON_ENABLE_ORDERING", "false").strip().casefold() == "true"
+
+
+def max_order_total() -> float:
+    """A hard ceiling on what one order may cost (AGENTS.md requires a price limit)."""
+    try:
+        return float(os.getenv("AMAZON_MAX_ORDER_TOTAL", "100"))
+    except ValueError:
+        return 100.0
+
+
+ORDER_AUDIT_PATH = Path(
+    os.getenv("AMAZON_ORDER_AUDIT_LOG", str(Path.home() / "Library" / "Application Support"
+              / "Amazon Agent" / "orders.log"))
+)
+
+
+def _audit(event: str) -> None:
+    """Append-only record of every order attempt, successful or not."""
+    try:
+        ORDER_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with ORDER_AUDIT_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {event}\n")
+    except Exception as error:  # noqa: BLE001 - logging must never break an order
+        print(f"[AMAZON] could not write the order audit log: {error}")
 
 
 def cart_writes_enabled() -> bool:
@@ -865,6 +897,157 @@ async def _read_destination_in_browser() -> Destination:
         finally:
             await page.close()
     return Destination(address, card)
+
+
+PROCEED_TO_CHECKOUT = 'input[name="proceedToRetailCheckout"], #sc-buy-box-ptc-button input'
+PLACE_ORDER_SELECTOR = (
+    '#placeYourOrder input, input[name="placeYourOrder1"], #submitOrderButtonId input, '
+    '#bottomSubmitOrderButtonId input, #placeYourOrder, #submitOrderButtonId'
+)
+CART_SUBTOTAL_SELECTOR = "#sc-subtotal-amount-activecart, #sc-subtotal-amount-buybox"
+ORDER_CONFIRMATION_URL = re.compile(r"/gp/buy/thankyou|order-?confirm|thankyou", re.IGNORECASE)
+ORDER_ID = re.compile(r"\b(\d{3}-\d{7}-\d{7})\b")
+# Amazon states a payment problem in prose rather than a status code.
+DECLINE_TEXT = re.compile(
+    r"payment method was declined|card was declined|declined by (?:your|the) bank|"
+    r"there(?:'s| is) a problem with your payment|revise payment|payment revision needed|"
+    r"we cannot process your payment|unable to process your payment",
+    re.IGNORECASE,
+)
+SIGN_IN_URL = re.compile(r"/ap/signin|/ap/cvf|forgotpassword", re.IGNORECASE)
+
+
+@dataclass(frozen=True, slots=True)
+class OrderResult:
+    """What actually happened, never what was assumed to happen."""
+
+    placed: bool
+    order_id: str | None = None
+    order_url: str | None = None
+    detail: str | None = None
+    needs_sign_in: bool = False
+    declined: bool = False
+
+
+def _amount(text: str | None) -> float | None:
+    if not text:
+        return None
+    match = re.search(r"\d[\d,]*(?:\.\d{2})?", text.replace("\xa0", " "))
+    try:
+        return float(match.group().replace(",", "")) if match else None
+    except ValueError:
+        return None
+
+
+async def place_order(*, max_total: float | None = None) -> OrderResult:
+    """Place the real Amazon order for whatever is in the cart.
+
+    Every refusal below is a deliberate control, not an accident of implementation:
+
+    - Ordering is off unless `AMAZON_ENABLE_ORDERING=true`, so no stale configuration
+      can spend money.
+    - The cart total is checked against a ceiling before checkout is even opened, and
+      again against the order total Amazon states on the review page. A total that
+      grew between those two reads is refused rather than paid.
+    - Amazon requires a fresh sign-in before checkout (`max_auth_age=900`). This
+      application never authenticates, so that redirect is reported as a failure for
+      the user to resolve, never worked around.
+    - Every attempt is written to an append-only audit log.
+    """
+    ceiling = max_order_total() if max_total is None else max_total
+    if not ordering_enabled():
+        return OrderResult(False, detail="Ordering is switched off (AMAZON_ENABLE_ORDERING is not true).")
+
+    async with _persistent_browser_context() as context:
+        page = await context.new_page()
+        try:
+            await page.goto(CART_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(2_000)
+
+            subtotal = _amount(await _text_or_none(page.locator(CART_SUBTOTAL_SELECTOR).first))
+            if subtotal is None:
+                _audit("REFUSED no-readable-subtotal")
+                return OrderResult(False, detail="I could not read the cart total, so I did not order.")
+            if subtotal > ceiling:
+                _audit(f"REFUSED over-ceiling subtotal={subtotal} ceiling={ceiling}")
+                return OrderResult(
+                    False,
+                    detail=f"The cart comes to ${subtotal:.2f}, above the ${ceiling:.2f} limit. "
+                           "Raise AMAZON_MAX_ORDER_TOTAL if that is intended.",
+                )
+
+            proceed = page.locator(PROCEED_TO_CHECKOUT).first
+            if not await proceed.count():
+                _audit("REFUSED no-proceed-control")
+                return OrderResult(False, detail="Amazon showed no checkout button on the cart.")
+            await proceed.click()
+            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+            await page.wait_for_timeout(4_000)
+
+            if SIGN_IN_URL.search(page.url):
+                _audit("BLOCKED sign-in-required")
+                return OrderResult(
+                    False,
+                    needs_sign_in=True,
+                    detail="Amazon wants you to sign in again before it will accept an order.",
+                )
+
+            button = page.locator(PLACE_ORDER_SELECTOR).first
+            try:
+                await button.wait_for(state="attached", timeout=15_000)
+            except PlaywrightTimeoutError:
+                pass
+            if not await button.count():
+                _audit("REFUSED no-place-order-control")
+                return OrderResult(
+                    False,
+                    detail="I could not find Amazon's Place Order button, so nothing was submitted.",
+                )
+
+            body = " ".join((await page.locator("body").inner_text()).split())
+            stated = _amount((re.search(r"Order total:?\s*(\$[\d,]+\.\d{2})", body, re.I) or [None, None])[1])
+            if stated is not None and stated > ceiling:
+                _audit(f"REFUSED order-total-over-ceiling stated={stated} ceiling={ceiling}")
+                return OrderResult(
+                    False,
+                    detail=f"Amazon's order total is ${stated:.2f}, above the ${ceiling:.2f} limit. "
+                           "Nothing was submitted.",
+                )
+
+            _audit(f"PLACING subtotal={subtotal} stated_total={stated} ceiling={ceiling}")
+            await button.click()
+            await page.wait_for_load_state("domcontentloaded", timeout=45_000)
+            await page.wait_for_timeout(4_000)
+
+            after = " ".join((await page.locator("body").inner_text()).split())
+            if DECLINE_TEXT.search(after):
+                _audit("FAILED payment-declined")
+                return OrderResult(
+                    False,
+                    declined=True,
+                    detail="Amazon rejected the payment method. Nothing was ordered.",
+                )
+
+            order_id = (ORDER_ID.search(after) or [None, None])[1]
+            if ORDER_CONFIRMATION_URL.search(page.url) or order_id:
+                _audit(f"PLACED order_id={order_id}")
+                return OrderResult(
+                    True,
+                    order_id=order_id,
+                    order_url="https://www.amazon.com/gp/css/order-history",
+                    detail=None,
+                )
+            _audit("UNCONFIRMED no-confirmation-page")
+            return OrderResult(
+                False,
+                detail="Amazon did not show a confirmation, so I cannot tell you the order "
+                       "went through. Check your Amazon orders before trying again.",
+            )
+        except Exception as error:  # noqa: BLE001 - the reply must never be an exception
+            _audit(f"ERROR {str(error)[:120]}")
+            return OrderResult(False, detail=f"The order could not be completed ({str(error)[:100]}).")
+        finally:
+            await page.close()
 
 
 SEARCH_ATTEMPTS = 2

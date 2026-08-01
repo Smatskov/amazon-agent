@@ -4,8 +4,8 @@ The gate exists to make the final, irreversible step deliberate. Two rules matte
 
 1. A confirmation applies to *exact* order contents. Changing anything invalidates it
    (ADR-026), which `confirmation_token()` enforces by hashing the contents.
-2. Order placement is not implemented. `place_order()` exists so that the refusal is
-   explicit and testable rather than an accidental gap, and it always raises.
+2. Order placement lives in `amazon.py`, behind its own kill switch, price ceiling,
+   and audit log. Nothing here submits an order.
 
 Nothing in this module contacts Amazon. The subtotal is arithmetic over prices that a
 read-only search already returned; shipping, tax, and delivery are not known and are
@@ -28,10 +28,6 @@ UNKNOWN_AT_CHECKOUT = (
     "delivery date",
     "the delivery address Amazon would use",
 )
-
-
-class OrderPlacementDisabled(RuntimeError):
-    """Raised if anything ever attempts to place an order."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,16 +76,3 @@ def summarize(workflow: PurchaseWorkflow) -> CheckoutSummary:
 def is_confirmation_current(workflow: PurchaseWorkflow) -> bool:
     """True only when the user confirmed these exact contents."""
     return bool(workflow.confirmed_token) and workflow.confirmed_token == confirmation_token(workflow)
-
-
-def place_order(workflow: PurchaseWorkflow) -> None:
-    """Never places an order.
-
-    Kept as a named, always-raising boundary so the absence of ordering is asserted by
-    a test rather than assumed. Implementing this requires the safety controls in
-    ADR-026: authorization, price limits, duplicate prevention, idempotency, audit
-    records, and verification of the external result.
-    """
-    raise OrderPlacementDisabled(
-        "Order placement is not implemented. No code path may submit an Amazon order."
-    )

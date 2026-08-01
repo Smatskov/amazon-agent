@@ -7,10 +7,10 @@ it searches Amazon, and you pick from numbered options until your list is ready.
 none can write anything you see (ADR-051). It searches, ranks, presents numbered results,
 answers questions from stored facts, builds a list, and prepares an order summary.
 
-**Confirming puts your list into your real Amazon cart.** That is the one action that changes
-anything in your account. **It stops there: no code path can place an order** — you complete
-the purchase on Amazon yourself. See `Handoff Files/PROJECT_STATE.md` for the current
-checkpoint and `Handoff Files/OPEN_ISSUES.md` for known gaps.
+**Checking out puts your list into your real Amazon cart, and "Place the order" submits a
+real order.** Ordering is **off by default** and refuses unless `AMAZON_ENABLE_ORDERING=true`.
+See `Handoff Files/PROJECT_STATE.md` for the current checkpoint and
+`Handoff Files/OPEN_ISSUES.md` for known gaps.
 
 ## How it works
 
@@ -98,20 +98,27 @@ PYTHONPATH=src .venv/bin/python -u scripts/amazon_live_probe.py "AA batteries"
 
 ## Safety
 
-Purchasing is staged: search → list → checkout summary → explicit confirmation → **ordering
-is not implemented**. Confirmation writes to your real Amazon cart; nothing submits an order.
+The flow is: search → list → checkout (writes your real Amazon cart) → **Place the order**
+(submits a real order). Five controls stand between a menu tap and a purchase:
 
-Four things enforce that, rather than one:
+- **A kill switch.** Ordering refuses unless `AMAZON_ENABLE_ORDERING` is exactly `true`. A
+  stale or copied `.env` cannot spend money.
+- **A price ceiling.** `AMAZON_MAX_ORDER_TOTAL` is checked against the cart total *before*
+  checkout opens and again against the total Amazon states on its review page. A total that
+  grew between those two reads is refused rather than paid.
+- **An audit log.** Every attempt — refused, blocked, placed, declined — is appended to
+  `AMAZON_ORDER_AUDIT_LOG` with a timestamp.
+- **No password, ever.** Amazon requires a fresh sign-in before checkout
+  (`max_auth_age=900`). This application never authenticates; that redirect is reported to
+  you to resolve, never worked around.
+- **No language model can write to you**, so none can claim an order was placed. A test
+  asserts no module outside `intent_classifier` even mentions `generate_response`.
 
-- `amazon.py` exposes search and cart add/remove only. There is no order function to call, and
-  `_refuse_ordering_url()` blocks navigation to any checkout URL.
-- Cart writes click `#add-to-cart-button` by exact id, so the control can never resolve to
-  "Buy Now", which sits beside it on the product page. Success is confirmed by reading
-  Amazon's own cart badge rather than assumed.
-- `checkout.place_order()` exists only to raise, and tests assert nothing calls it.
-- **No language model can write to you**, so none can claim an order was placed. A test asserts
-  no module outside `intent_classifier` even mentions `generate_response`.
+Ordering is also reported honestly: if Amazon shows no confirmation page, the reply says the
+outcome is unknown and to check your orders — it is never reported as success.
 
+Cart writes click `#add-to-cart-button` by exact id, so the control can never resolve to
+"Buy Now" beside it, and success is read from Amazon's own cart badge rather than assumed.
 Set `AMAZON_ENABLE_CART=false` to disable cart writes entirely.
 
 Prices are copied from search results rather than recomputed, so a subtotal is the sum of what

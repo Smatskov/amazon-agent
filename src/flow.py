@@ -65,13 +65,24 @@ def variant_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
     Choosing here resolves to a child ASIN, and the number the user types is the thing
     that gets added.
     """
+    described = _described_asin(workflow)
     return [
-        MenuOption(MenuAction.CHOOSE_VARIANT, label, asin)
+        MenuOption(
+            MenuAction.CHOOSE_VARIANT,
+            f"{label} — this is the one shown in the results" if asin == described else label,
+            asin,
+        )
         for asin, label, _ in workflow.pending_variants
     ] + [
         MenuOption(MenuAction.SHOW_OPTIONS, "None of these — back to the results"),
         MenuOption(MenuAction.CANCEL, "Start over"),
     ]
+
+
+def _described_asin(workflow: PurchaseWorkflow) -> str | None:
+    """The child the search result itself pointed at, which is the one the user saw."""
+    selected = workflow.selected_candidate_id or ""
+    return selected.removeprefix("amazon-") if selected.startswith("amazon-") else None
 
 
 QUANTITY_CHOICES = (1, 2, 3, 4, 5)
@@ -109,16 +120,35 @@ def cart_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
     return options
 
 
+AMAZON_CART_PREFIX = "amazon-cart:"
+
+
 def remove_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:
-    """Removing costs money, so each line shows what it is worth as well as its name."""
-    return [
+    """Everything an order would buy, so anything can be taken back out.
+
+    Includes items already in the Amazon cart that this conversation did not add: they
+    would be ordered too, so showing them in the warning while offering no way to drop
+    them left the user with a problem and no control.
+    """
+    options = [
         MenuOption(
             MenuAction.REMOVE,
             f"{product_display.display_title(line.title)} — {line.price_text or 'price not shown'}",
             line.candidate_id,
         )
         for line in workflow.cart
-    ] + [MenuOption(MenuAction.VIEW_LIST, "Keep everything")]
+    ]
+    options += [
+        MenuOption(
+            MenuAction.REMOVE,
+            f"{product_display.display_title(row[0])} — "
+            f"{row[1] or 'price not shown'} (already in your Amazon cart)",
+            f"{AMAZON_CART_PREFIX}{row[3]}",
+        )
+        for row in workflow.amazon_cart
+        if len(row) > 3 and row[3] and not row[2]
+    ]
+    return options + [MenuOption(MenuAction.VIEW_LIST, "Keep everything")]
 
 
 def ready_to_order_menu(workflow: PurchaseWorkflow) -> list[MenuOption]:

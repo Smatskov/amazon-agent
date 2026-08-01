@@ -66,24 +66,33 @@ CAPTION_LIMIT = 1024
 
 
 async def _send_photos(update: Update, photos: list[list[str]]) -> None:
-    """Send the product images for the results just listed.
+    """Send the product images as one album, in the order of the numbered results.
 
-    Pictures are the only way to judge size and pack from a chat message, so they are
-    worth an extra send. They are strictly an enhancement: any failure is logged and
-    swallowed, because a broken image URL must never cost the user their results.
+    Telegram preserves media-group order, so image N is always option N. It renders
+    only the *first* item's caption beneath a collapsed album, so that caption carries
+    the key for the whole set rather than describing one photo — five options under a
+    caption reading "1 · ..." looked like the entire block was option 1.
+
+    Images are strictly an enhancement: any failure is logged and swallowed, because a
+    broken image URL must never cost the user their results.
     """
     if not photos:
         return
     try:
+        usable = [(url, caption) for url, caption in photos[:TELEGRAM_ALBUM_LIMIT] if url]
+        if not usable:
+            return
+        if len(usable) == 1:
+            await update.message.reply_photo(usable[0][0], caption=usable[0][1][:CAPTION_LIMIT])
+            return
+        # Only the first item is captioned: Telegram shows that one under the album,
+        # and captioning several makes clients disagree about which appears.
+        key = "\n".join(caption for _, caption in usable)
         media = [
-            InputMediaPhoto(media=url, caption=caption[:CAPTION_LIMIT])
-            for url, caption in photos[:TELEGRAM_ALBUM_LIMIT]
-            if url
+            InputMediaPhoto(media=url, caption=key[:CAPTION_LIMIT] if index == 0 else None)
+            for index, (url, _) in enumerate(usable)
         ]
-        if len(media) == 1:
-            await update.message.reply_photo(media[0].media, caption=media[0].caption)
-        elif media:
-            await update.message.reply_media_group(media)
+        await update.message.reply_media_group(media)
     except Exception as error:  # noqa: BLE001 - images must never break a reply
         print(f"[TELEGRAM] could not send product images: {error}")
 

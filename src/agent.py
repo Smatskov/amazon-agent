@@ -128,6 +128,9 @@ def _show_results(
 ) -> str:
     picks, actions = flow.results_menu(workflow, ranked.candidates)
     flow.store(workflow, picks + actions)
+    # One line per photo. Telegram shows only the first caption under an album, so the
+    # transport joins these into a single key for the whole set: a caption describing
+    # just the first image made five options look like one.
     workflow.pending_photos = [
         [c.image_url, f"{i} · {product_display.display_title(c.title)} — "
                       f"{c.price_text or 'price not shown'}"]
@@ -211,6 +214,10 @@ async def _execute_menu_choice(
     if action is MenuAction.SET_QUANTITY:
         return _set_quantity(workflow, option.payload, workflow_database_path)
     if action is MenuAction.REMOVE:
+        if option.payload and option.payload.startswith(AMAZON_CART_PREFIX):
+            return await _remove_from_amazon_cart(
+                workflow, option.payload.removeprefix(AMAZON_CART_PREFIX), workflow_database_path
+            )
         if option.payload:
             workflow.cart = cart.remove(workflow.cart, option.payload)
             workflow.confirmed_token = None
@@ -504,7 +511,10 @@ async def _select_or_ask_variant(
         # One option, or none stated: nothing to choose, so add what was picked.
         return _select_candidate(workflow, candidate, workflow_database_path)
 
-    workflow.pending_variants = [[v.asin, v.label, v.url] for v in variants]
+    described = amazon.asin_from_url(candidate.source_url or "")
+    workflow.pending_variants = ranking.sort_variants(
+        [[v.asin, v.label, v.url] for v in variants], described
+    )
     workflow.selected_candidate_id = candidate.candidate_id
     options = flow.store(workflow, flow.variant_menu(workflow))
     workflow_store.transition(
@@ -711,6 +721,7 @@ async def _place_order(
         return product_display.present_order_failed(
             summary, options, result.detail,
             needs_sign_in=result.needs_sign_in, declined=result.declined,
+            needs_card_verification=result.needs_card_verification,
         )
 
     workflow.cart = []
@@ -785,6 +796,38 @@ async def _push_to_amazon_cart(workflow: PurchaseWorkflow) -> str:
     return "\n".join(lines)
 
 
+AMAZON_CART_PREFIX = "amazon-cart:"
+
+
+async def _remove_from_amazon_cart(
+    workflow: PurchaseWorkflow, asin: str, workflow_database_path: str | Path
+) -> str:
+    """Take an item out of the real Amazon cart that this conversation did not add.
+
+    The order the user would place is the whole cart, so being able to see a stray
+    item without being able to remove it left them with a warning and no remedy.
+    """
+    title = next(
+        (row[0] for row in workflow.amazon_cart if len(row) > 3 and row[3] == asin), asin
+    )
+    try:
+        await amazon.remove_from_cart(asin)
+    except Exception as error:  # noqa: BLE001 - report, never raise into a reply
+        return (
+            f"I could not remove {product_display.display_title(title)} from your "
+            f"Amazon cart ({str(error)[:100]})."
+        )
+    workflow.amazon_cart = [
+        row for row in workflow.amazon_cart if not (len(row) > 3 and row[3] == asin)
+    ]
+    workflow.confirmed_token = None
+    workflow_store.save_workflow(workflow, workflow_database_path)
+    return (
+        f"Removed {product_display.display_title(title)} from your Amazon cart.\n\n"
+        f"{_show_cart(workflow, workflow_database_path)}"
+    )
+
+
 async def _read_real_cart(workflow: PurchaseWorkflow) -> None:
     """Record the whole Amazon cart, marking which lines this conversation added.
 
@@ -804,7 +847,12 @@ async def _read_real_cart(workflow: PurchaseWorkflow) -> None:
         workflow.amazon_cart = []
         return
     workflow.amazon_cart = [
-        [item.title, item.price, bool((asin := amazon.asin_from_url(item.url)) and asin in ours)]
+        [
+            item.title,
+            item.price,
+            bool((asin := amazon.asin_from_url(item.url)) and asin in ours),
+            asin,
+        ]
         for item in real
     ]
 

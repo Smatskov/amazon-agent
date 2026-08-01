@@ -64,6 +64,34 @@ class AmazonCartUnavailable(RuntimeError):
     """The cart operation could not be completed safely."""
 
 
+class AmazonSignInRequired(RuntimeError):
+    """The saved Amazon session has expired and needs a manual sign-in."""
+
+
+SESSION_EXPIRED_HINT = (
+    "Your Amazon session has expired. Run "
+    "`PYTHONPATH=src .venv/bin/python scripts/amazon_profile_login.py`, sign in, then "
+    "try again."
+)
+
+
+async def _refuse_if_signed_out(page) -> None:
+    """Name an expired session rather than letting it look like a missing page.
+
+    Every read failed silently before this: a sign-in page has no product cards and no
+    "Sorry" title, so a search reported "Amazon did not return usable search results,
+    please try again later" — advice that is exactly wrong, because waiting makes an
+    expired session worse rather than better.
+    """
+    try:
+        if SIGN_IN_URL.search(page.url) or "sign-in" in (await page.title()).casefold():
+            raise AmazonSignInRequired(SESSION_EXPIRED_HINT)
+    except AmazonSignInRequired:
+        raise
+    except Exception:  # noqa: BLE001 - a failed check must not mask the real error
+        return
+
+
 # Cart writes touch a real account, so the control that may be clicked is named
 # exactly, never matched loosely. An id selector cannot resolve to "Buy Now".
 ADD_TO_CART_BUTTON_ID = "add-to-cart-button"
@@ -479,6 +507,7 @@ async def _search_in_context(
                 timeout=BROWSER_RESULTS_TIMEOUT_MS,
             )
         except PlaywrightTimeoutError as error:
+            await _refuse_if_signed_out(page)
             title = (await page.title()).strip()
             if "sorry" in title.casefold():
                 raise AmazonSearchUnavailable(
@@ -900,10 +929,51 @@ async def _read_destination_in_browser() -> Destination:
 
 
 PROCEED_TO_CHECKOUT = 'input[name="proceedToRetailCheckout"], #sc-buy-box-ptc-button input'
+# Amazon renders a button as a <span> label with an <input type="submit"> laid over
+# it, and the input is what receives the click — targeting the label times out with
+# "input intercepts pointer events". Every selector here names the input.
+# Mapped live on Amazon's "spc" review page. The real control is
+#   <input id="placeOrder" data-testid="SPC_selectPlaceOrder"
+#          data-csa-c-slot-id="checkout-place-your-order-button" value="Place your order">
+# The page also renders *disabled* twins with the same id="placeOrder" — notably
+# data-testid="SPC_animatedDisabledPlaceOrderTop". Matching on the id alone and taking
+# the first hit can therefore resolve to a control that will never submit, so the
+# enabled test-id is named first and the result is checked for being enabled before
+# it is clicked.
 PLACE_ORDER_SELECTOR = (
-    '#placeYourOrder input, input[name="placeYourOrder1"], #submitOrderButtonId input, '
-    '#bottomSubmitOrderButtonId input, #placeYourOrder, #submitOrderButtonId'
+    'input[data-csa-c-slot-id="checkout-place-your-order-button"][data-testid="SPC_selectPlaceOrder"], '
+    'input[data-testid="SPC_selectPlaceOrder"], '
+    'input[name="placeYourOrder1"], #submitOrderButtonId input, '
+    '#bottomSubmitOrderButtonId input, #placeYourOrder input'
 )
+DISABLED_ORDER_TESTID = "SPC_animatedDisabledPlaceOrderTop"
+# "Use this payment method" / "Continue" between checkout steps. Advancing a step
+# selects what is already the default; it does not buy anything.
+CHECKOUT_CONTINUE_SELECTOR = (
+    'input[data-testid="secondary-continue-button"], '
+    'input[data-testid="bottom-continue-button"], '
+    'input[data-csa-c-slot-id*="continue"]'
+)
+# Amazon injects a Prime free-trial offer mid-checkout for non-members. Declining is
+# required to reach the review page. The accept control must never be clicked: it
+# enrols the user in a paid subscription that they did not ask for.
+PRIME_DECLINE_TEXT = re.compile(r"^\s*No thanks\s*$", re.IGNORECASE)
+NEVER_CLICK = re.compile(
+    r"get free prime|free trial|sign up for prime|start your free trial|join prime|buy now",
+    re.IGNORECASE,
+)
+MAX_CHECKOUT_STEPS = 6
+# Amazon can require the full card number to be re-entered before it will accept an
+# order with that card. This application never types a card number, so the wall is
+# reported to the user rather than worked around. It is a one-time step per card.
+CARD_VERIFICATION = re.compile(
+    r"verify your card|re-?enter your card number|verify this is an authorized use|"
+    r"verify card",
+    re.IGNORECASE,
+)
+# A blocked step leaves its button present but unclickable, so a click waits the full
+# default timeout and surfaces a raw Playwright error. Bound it and re-read the page.
+CHECKOUT_CLICK_TIMEOUT_MS = 8_000
 CART_SUBTOTAL_SELECTOR = "#sc-subtotal-amount-activecart, #sc-subtotal-amount-buybox"
 ORDER_CONFIRMATION_URL = re.compile(r"/gp/buy/thankyou|order-?confirm|thankyou", re.IGNORECASE)
 ORDER_ID = re.compile(r"\b(\d{3}-\d{7}-\d{7})\b")
@@ -927,6 +997,47 @@ class OrderResult:
     detail: str | None = None
     needs_sign_in: bool = False
     declined: bool = False
+    needs_card_verification: bool = False
+
+
+async def _enabled_order_button(page):
+    """Return the order control only when it is real and clickable, else None.
+
+    Amazon renders disabled twins of the button sharing id="placeOrder". Clicking one
+    submits nothing while looking like it worked, so being enabled is part of what
+    makes a match a match.
+    """
+    candidates = page.locator(PLACE_ORDER_SELECTOR)
+    for index in range(min(await candidates.count(), 6)):
+        control = candidates.nth(index)
+        try:
+            if await control.get_attribute("data-testid") == DISABLED_ORDER_TESTID:
+                continue
+            if not await control.is_enabled():
+                continue
+        except Exception:  # noqa: BLE001 - an unreadable control is not a usable one
+            continue
+        return control
+    return None
+
+
+async def _click_step(page, locator) -> bool:
+    """Click a checkout control, returning False when it refuses rather than raising.
+
+    A gated step keeps its button in the DOM but will not accept the click, so an
+    unbounded click waits the full default timeout and surfaces a raw Playwright
+    error into the user's reply.
+    """
+    try:
+        await locator.click(timeout=CHECKOUT_CLICK_TIMEOUT_MS)
+    except Exception as error:  # noqa: BLE001 - a refused click is information
+        print(f"[AMAZON] checkout step would not advance: {str(error)[:90]}")
+        return False
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def _amount(text: str | None) -> float | None:
@@ -958,7 +1069,11 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
     if not ordering_enabled():
         return OrderResult(False, detail="Ordering is switched off (AMAZON_ENABLE_ORDERING is not true).")
 
-    async with _persistent_browser_context() as context:
+    # Deliberately visible. Verified live: the same profile and the same session reach
+    # checkout cleanly in a visible browser, while a headless one is redirected to
+    # /ap/signin. The session is genuinely authenticated either way — this is a real
+    # browser rather than a hidden one, not a disguised one.
+    async with _persistent_browser_context(headless=False) as context:
         page = await context.new_page()
         try:
             await page.goto(CART_URL, wait_until="domcontentloaded", timeout=30_000)
@@ -992,16 +1107,58 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
                     detail="Amazon wants you to sign in again before it will accept an order.",
                 )
 
-            button = page.locator(PLACE_ORDER_SELECTOR).first
-            try:
-                await button.wait_for(state="attached", timeout=15_000)
-            except PlaywrightTimeoutError:
-                pass
-            if not await button.count():
+            # Checkout is a multi-step pipeline whose steps vary by account and cart:
+            # a Prime upsell, a payment step, sometimes a delivery step. Rather than
+            # assume a fixed sequence, advance whatever this page offers until the
+            # order control appears, and stop if it never does.
+            button = None
+            for _ in range(MAX_CHECKOUT_STEPS):
+                await page.wait_for_timeout(2_500)
+                found = await _enabled_order_button(page)
+                if found is not None:
+                    button = found
+                    break
+
+                # Amazon blocks the step until the card is verified, which needs the
+                # full card number typed. That is never done here.
+                page_text = " ".join((await page.locator("body").inner_text()).split())
+                if CARD_VERIFICATION.search(page_text):
+                    _audit("BLOCKED card-verification-required")
+                    return OrderResult(
+                        False,
+                        needs_card_verification=True,
+                        detail="Amazon wants your card verified before it will accept this order.",
+                    )
+
+                decline = page.get_by_text(PRIME_DECLINE_TEXT).first
+                if await decline.count():
+                    label = (await decline.inner_text() or "").strip()
+                    if NEVER_CLICK.search(label):
+                        _audit(f"REFUSED would-have-clicked {label!r}")
+                        return OrderResult(False, detail="Refusing to accept a paid Amazon offer.")
+                    await _click_step(page, decline)
+                    continue
+
+                advance = page.locator(CHECKOUT_CONTINUE_SELECTOR).first
+                if await advance.count():
+                    if not await _click_step(page, advance):
+                        # The control is present but will not accept a click, which
+                        # means the step is gated on something only the user can do.
+                        _audit("BLOCKED checkout-step-would-not-advance")
+                        return OrderResult(
+                            False,
+                            detail="Amazon's checkout would not move past the payment step. "
+                                   "Open your cart on Amazon and finish it there.",
+                        )
+                    continue
+                break
+
+            if button is None or not await button.count():
                 _audit("REFUSED no-place-order-control")
                 return OrderResult(
                     False,
-                    detail="I could not find Amazon's Place Order button, so nothing was submitted.",
+                    detail="I got as far as Amazon's checkout but could not find its Place "
+                           "Order button, so nothing was submitted. Finish this one on Amazon.",
                 )
 
             body = " ".join((await page.locator("body").inner_text()).split())

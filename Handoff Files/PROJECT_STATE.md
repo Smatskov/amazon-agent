@@ -8,13 +8,13 @@ Status: The shopping conversation is menu-driven and entirely deterministic. Sea
 
 **Ordering cannot succeed until you have signed in to Amazon recently.** Amazon requires a fresh sign-in before checkout (`max_auth_age=900`, verified live); the agent never authenticates and reports that redirect as your step.
 
-Decisions are append-only in `Handoff Files/DECISIONS.md` (ADR-001 through ADR-062). Live findings and open bugs are in `Handoff Files/OPEN_ISSUES.md`.
+Decisions are append-only in `Handoff Files/DECISIONS.md` (ADR-001 through ADR-064). Live findings and open bugs are in `Handoff Files/OPEN_ISSUES.md`.
 
 ## What is verified, and what is not
 
 Verified in this session:
 
-- **609 tests pass** (`.venv/bin/python -m pytest -q`), including 58 regressions pinning every UAT session 5 and 6 failure, plus **11,000 fuzzed conversation turns** against a deliberately unreliable model.
+- **628 tests pass** (`.venv/bin/python -m pytest -q`), including 58 regressions pinning every UAT session 5 and 6 failure, plus **11,000 fuzzed conversation turns** against a deliberately unreliable model.
 - **Live against real Amazon, read-only** — the search pipeline was re-verified end to end after the fixes:
   - `oral b toothbrush 4 pack` returns five *distinguishable* titles (was five lines reading `Oral-B`).
   - `melatonin 10mg` drops the `One Medical Membership — $99.00` placement (`dropped as unrelated: 1`).
@@ -73,7 +73,7 @@ Deleted in this session, each existing only to let the model talk about products
 
 ## Test coverage
 
-**609 passing.** External boundaries are blocked in `tests/conftest.py`: no test can open a browser (`amazon.async_playwright`) or reach LM Studio (`llm_client.generate_response`), and default database paths are redirected so nothing writes to `data/`.
+**628 passing.** External boundaries are blocked in `tests/conftest.py`: no test can open a browser (`amazon.async_playwright`) or reach LM Studio (`llm_client.generate_response`), and default database paths are redirected so nothing writes to `data/`.
 
 | Test file | Tests | Covers |
 | --- | --- | --- |

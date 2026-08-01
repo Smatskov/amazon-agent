@@ -100,12 +100,16 @@ def test_facts_show_price_and_arrival_but_not_review_counts():
 
 
 def test_facts_report_a_missing_price_rather_than_omitting_it():
-    # The pack count is now always stated too, including when Amazon did not state it:
-    # a price with no quantity beside it cannot be compared or trusted.
     facts = product_display.candidate_facts(_candidate("Mystery"))
 
     assert facts.startswith("price not shown")
-    assert "count not stated" in facts
+
+
+def test_an_absent_pack_count_is_simply_not_mentioned():
+    """Most listings state no count, so warning about it was noise on nearly every
+    line. The variation picker is what protects the user here (ADR-058)."""
+    assert product_display._pack_fact(_candidate("OtterBox Defender Case, Black")) == ""
+    assert product_display._pack_fact(_candidate("Colgate Toothbrush, 6 Pack")) == "6 in the pack"
 
 
 # --- escaping -----------------------------------------------------------------

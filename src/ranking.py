@@ -450,6 +450,49 @@ def _rank_by_rating(candidates: list[Candidate]) -> RankedCandidates:
     return RankedCandidates(ordered + unrated, "customer rating", caveat)
 
 
+# Size words, largest first. "pro max" must be tested before "pro" or it never matches.
+VARIANT_SIZE_RANK = (("pro max", 5), ("promax", 5), ("plus", 4), ("max", 4),
+                     ("pro", 3), ("mini", 1), ("se", 1))
+DEFAULT_SIZE_RANK = 2
+
+
+def sort_variants(rows: list[list], described_asin: str | None = None) -> list[list]:
+    """Order the versions of one product so the list can be read rather than scanned.
+
+    Applies **only** to the variation picker. The search-results ordering is decided by
+    `rank()` and is deliberately untouched: those are different products competing on
+    price, while these are one product's versions competing on which the user owns.
+
+    Order: the version the search result actually described comes first, because that
+    is the one whose price and picture the user just looked at. The rest go newest
+    model first, then largest size, then colour — so an iPhone 17 Pro case is never
+    buried under a case for an iPhone 8.
+    """
+    def key(row: list) -> tuple:
+        asin = row[0] if row else ""
+        label = row[1] if len(row) > 1 else ""
+        parts = [part.strip() for part in label.split("·") if part.strip()]
+        tail = parts[-1] if parts else label
+        head = " ".join(parts[:-1]) if len(parts) > 1 else ""
+        # A stated pack size wins over any other number in the value: "3.8 Ounce
+        # (Pack of 3)" is a bigger buy than "(Pack of 1)", and taking the largest
+        # number would compare the ounces instead and call them equal.
+        pack = pack_count(tail)
+        numbers = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", tail)]
+        model = float(pack) if pack else (max(numbers) if numbers else 0.0)
+        lowered = tail.casefold()
+        size = next((rank for word, rank in VARIANT_SIZE_RANK if word in lowered), DEFAULT_SIZE_RANK)
+        return (
+            0 if described_asin and asin == described_asin else 1,
+            -model,
+            -size,
+            head.casefold(),
+            tail.casefold(),
+        )
+
+    return sorted(rows, key=key)
+
+
 def _fold(word: str) -> str:
     """Fold a simple plural so "tablets" and "tablet" compare equal."""
     if word.endswith(("ses", "xes", "zes", "ches", "shes")):

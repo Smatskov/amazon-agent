@@ -2026,3 +2026,83 @@ Reasoning:
 - An unconfirmed outcome is reported as unknown, never as success. Amazon not showing
   a confirmation page is not the same as an order failing, and the user is told to
   check their orders rather than being told either story.
+
+---
+
+## ADR-063 — Ordering Drives a Visible Browser Through a Mapped Checkout Pipeline
+
+Status: Accepted and implemented; corrects the conclusion recorded in ADR-061
+
+Decision:
+
+`place_order()` runs a **visible** browser and walks Amazon's checkout as a bounded
+state machine rather than a fixed sequence: on each pass, click the order control if
+it is present and enabled, otherwise decline an upsell, otherwise advance one step,
+otherwise stop. Capped at six steps.
+
+Context — the headless finding was wrong:
+
+ADR-061 recorded that Amazon requires re-authentication before checkout
+(`max_auth_age=900`) and treated that as an inherent ceiling on unattended ordering.
+That conclusion came from probes that were **all headless**, and it was wrong. The
+same profile, the same cookies and the same session reach
+`Place Your Order - Amazon Checkout` cleanly in a visible browser. The user pushed
+back on the conclusion; testing the one variable I had not varied disproved it.
+
+What the live mapping found:
+
+- **Amazon buttons are a `<span>` label with an `<input type="submit">` laid over
+  them.** Clicking the label times out with "input intercepts pointer events", which
+  is why the first selectors matched nothing.
+- **A Prime free-trial offer is injected mid-checkout for non-members.** Its prominent
+  button enrols the user in a paid subscription. Only the "No thanks" control may be
+  clicked, and `NEVER_CLICK` refuses the rest.
+- **The pipeline's shape varies.** With an unverified card there is a payment step;
+  with a working default card, checkout goes straight to the review page. A fixed
+  sequence would have broken on both.
+- **The review page renders several inputs sharing `id="placeOrder"`,** one of them a
+  disabled twin (`SPC_animatedDisabledPlaceOrderTop`). Matching the id and taking the
+  first hit can resolve to a control that submits nothing while appearing to work, so
+  being enabled is part of what makes a match a match.
+
+Reasoning:
+
+- A visible browser is a real browser with a genuinely authenticated session. Nothing
+  about it spoofs a fingerprint or defeats a bot check; it is the display mode that
+  ADR-047 chose for convenience, and the choice turned out to have a functional
+  consequence at checkout.
+- A state machine survives Amazon adding, removing or reordering steps. A recorded
+  click sequence would not.
+- Refusing to click an unknown control is the correct failure: the reply says the
+  order was not submitted, which is true and checkable.
+
+Consequences:
+
+- Card verification, an expired session, a paid-offer trap, a stalled step and a
+  missing control are each reported distinctly and logged distinctly.
+- The agent still never types a card number or a password. Both walls are handed back
+  to the user with what to do about them.
+
+---
+
+## ADR-064 — Tests Are Hermetic Against the Developer's `.env`
+
+Status: Accepted and implemented
+
+Decision:
+
+`conftest.py` forces `AMAZON_ENABLE_ORDERING=false` and a default price ceiling for
+every test, regardless of what the real `.env` contains.
+
+Context:
+
+`load_dotenv()` loads the developer's real `.env` into the test process. Switching
+ordering on for live testing therefore switched it on inside pytest too, and twenty
+tests changed behaviour. Nothing placed an order — the `async_playwright` blocker
+holds — but a suite whose behaviour depends on a config flag is one missing mock away
+from being able to spend money.
+
+Consequences:
+
+- The browser blocker is no longer the only thing standing between the test suite and
+  a real order; the kill switch is independently forced off.

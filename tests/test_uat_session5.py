@@ -615,7 +615,8 @@ def test_choosing_a_version_adds_that_exact_child_asin(paths, monkeypatch):
 
     _run("toothbrush", paths)
     _run("1", paths)
-    reply = _run("2", paths)   # the Pack of 3
+    # Sorting puts the larger pack first, so the Pack of 3 is option 1 (ADR-063).
+    reply = _run("1", paths)
 
     workflow = workflow_store.get_active_workflow(USER, paths[1])
     assert [line.candidate_id for line in workflow.cart] == ["amazon-B09NPNPKGS"]
@@ -764,3 +765,239 @@ def test_an_unconfirmed_outcome_is_never_reported_as_success(paths, monkeypatch)
     assert "cannot tell you the order went through" in reply
     assert "ORDER PLACED" not in reply
     assert len(workflow_store.get_workflow(USER, paths[1]).cart) == 1
+
+
+# --------------------------------------------------------------------------
+# Variant ordering (the picker only — the results list must not move)
+# --------------------------------------------------------------------------
+
+def _iphone_variants():
+    return [[a, l, ""] for a, l in [
+        ("A1", "Forest Green · For Iphone 17 Pro"), ("A2", "Blue Green · For Iphone Se/8"),
+        ("A3", "Cangling Green · For Iphone XR"), ("A4", "Desert Gold · iPhone 12/12 Pro"),
+        ("A6", "Red · For Iphone 16 Plus"), ("A8", "Light Pink · iPhone 15 Pro Max"),
+        ("A9", "Lavender Gray · For Iphone 15"), ("A11", "Cangling Green · For Iphone 16 Pro Max"),
+    ]]
+
+
+def test_variants_run_newest_model_then_largest_size_then_colour():
+    """ISSUE-053. Twelve versions arrived in Amazon's arbitrary order, so a case for
+    an iPhone 8 sat above the one for the phone the user actually has."""
+    ordered = ranking.sort_variants(_iphone_variants())
+
+    models = [row[1].split("·")[-1].strip() for row in ordered]
+    assert models[0] == "For Iphone 17 Pro"
+    assert models.index("For Iphone 16 Pro Max") < models.index("For Iphone 16 Plus")
+    assert models.index("iPhone 15 Pro Max") > models.index("For Iphone 16 Plus")
+    assert models[-1] == "For Iphone XR", "a model with no number is oldest"
+
+
+def test_the_version_the_result_described_is_pinned_first():
+    ordered = ranking.sort_variants(_iphone_variants(), "A6")
+
+    assert ordered[0][0] == "A6", "the version the user actually looked at leads"
+    # Everything after it is still in newest-first order.
+    assert ordered[1][1].endswith("For Iphone 17 Pro")
+
+
+def test_the_pinned_version_is_labelled_in_the_menu():
+    workflow = PurchaseWorkflow.new(1, "case", "case")
+    workflow.pending_variants = ranking.sort_variants(_iphone_variants(), "A6")
+    workflow.selected_candidate_id = "amazon-A6"
+
+    labels = [o.label for o in flow.variant_menu(workflow)]
+
+    assert labels[0].endswith("this is the one shown in the results")
+    assert sum("shown in the results" in label for label in labels) == 1
+
+
+def test_variant_sorting_never_touches_the_results_ordering(paths, monkeypatch):
+    """The five search results are different products competing on price and must keep
+    their cheapest-per-item order. Only one product's versions are re-sorted."""
+    monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_toothbrushes()))
+    monkeypatch.setattr(agent.amazon, "read_variants", AsyncMock(return_value=[]))
+
+    _run("toothbrush", paths)
+
+    titles = [c.title for c in workflow_store.get_active_workflow(USER, paths[1]).candidates]
+    assert titles[0].startswith("Colgate"), "cheapest per item still leads the results"
+    assert titles[-1].startswith("Oral-B Complete Sensitive")
+
+
+def test_pack_variants_sort_largest_first():
+    """The same rule has to behave for a non-phone product."""
+    rows = [["B1", "Swagger · 3.8 Ounce (Pack of 1)", ""],
+            ["B2", "Swagger · 3.8 Ounce (Pack of 3)", ""],
+            ["B3", "Aqua Reef · 3.8 Ounce (Pack of 3)", ""]]
+
+    ordered = ranking.sort_variants(rows)
+
+    assert [row[0] for row in ordered] == ["B3", "B2", "B1"], (
+        "packs of 3 lead the pack of 1, and colour breaks the tie between them"
+    )
+
+
+def test_a_stray_amazon_cart_item_can_be_removed(paths, monkeypatch):
+    """ISSUE-054. The warning named items the order would buy but offered no way to
+    drop them, leaving the user with a problem and no control."""
+    monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=_toothbrushes()))
+    monkeypatch.setattr(agent.amazon, "read_variants", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent.amazon, "add_many_to_cart", AsyncMock(
+        return_value=[amazon.CartWriteResult("https://www.amazon.com/dp/B00CC6XSSQ", 1, True)]))
+    monkeypatch.setattr(agent.amazon, "read_destination",
+                        AsyncMock(return_value=amazon.Destination(None, None)))
+    monkeypatch.setattr(agent.amazon, "read_cart", AsyncMock(return_value=[
+        amazon.Product("Colgate Extra Clean Full Head Toothbrush, Soft, 6 Pack", "$4.96",
+                       "https://www.amazon.com/dp/B00CC6XSSQ"),
+        amazon.Product("SUPFINE Magnetic for iPhone 17 Pro Case Forest Green", "$14.99",
+                       "https://www.amazon.com/dp/BCASE001"),
+    ]))
+    remove = AsyncMock(return_value=1)
+    monkeypatch.setattr(agent.amazon, "remove_from_cart", remove)
+
+    _run("toothbrush", paths)
+    _run("1", paths)          # add
+    _run("1", paths)          # check out
+    reply = _run("2", paths)  # Remove an item
+
+    assert "already in your Amazon cart" in reply, "the stray item must be offered"
+    assert "SUPFINE" in reply
+
+    workflow = workflow_store.get_active_workflow(USER, paths[1])
+    stray = next(o for o in workflow.pending_menu
+                 if o.payload and o.payload.startswith("amazon-cart:"))
+    after = _run(str(workflow.pending_menu.index(stray) + 1), paths)
+
+    remove.assert_awaited_once_with("BCASE001")
+    assert "Removed" in after
+
+
+def test_removing_a_stray_item_reports_a_failure_honestly(paths, monkeypatch):
+    workflow = PurchaseWorkflow.new(USER, "x", "x")
+    workflow.amazon_cart = [["Some Item", "$9.99", False, "BSTRAY01"]]
+    monkeypatch.setattr(agent.amazon, "remove_from_cart",
+                        AsyncMock(side_effect=RuntimeError("not in the cart")))
+
+    reply = asyncio.run(agent._remove_from_amazon_cart(workflow, "BSTRAY01", paths[1]))
+
+    assert "could not remove" in reply
+    assert workflow.amazon_cart, "a failed removal must not pretend the item is gone"
+
+
+# --------------------------------------------------------------------------
+# The checkout pipeline: what may be clicked, and what may never be
+# --------------------------------------------------------------------------
+
+def test_a_paid_amazon_offer_is_never_accepted():
+    """ISSUE-055. Amazon injects a Prime free-trial offer mid-checkout for non-members.
+    Its prominent button enrols the user in a $14.99/month subscription; only the
+    decline may be clicked."""
+    for accept in ["Get FREE Prime Delivery with Prime", "Start your free trial",
+                   "Sign up for Prime", "Join Prime", "Buy now"]:
+        assert amazon.NEVER_CLICK.search(accept), f"{accept!r} must be refused"
+    for safe in ["No thanks", "Use this payment method", "Place your order"]:
+        assert not amazon.NEVER_CLICK.search(safe), f"{safe!r} must stay clickable"
+
+
+def test_the_decline_control_is_matched_exactly():
+    assert amazon.PRIME_DECLINE_TEXT.match("No thanks")
+    assert amazon.PRIME_DECLINE_TEXT.match("  No thanks  ")
+    assert not amazon.PRIME_DECLINE_TEXT.match("No thanks, get Prime later")
+
+
+def test_every_order_selector_targets_the_clickable_input():
+    """Amazon lays an <input type=submit> over a <span> label; clicking the label
+    times out with "input intercepts pointer events"."""
+    for selector in (amazon.PLACE_ORDER_SELECTOR, amazon.CHECKOUT_CONTINUE_SELECTOR):
+        for part in selector.split(","):
+            part = part.strip()
+            assert "input" in part or part.startswith("#"), f"{part!r} is not an input"
+
+
+def test_the_pipeline_gives_up_rather_than_clicking_something_unknown(monkeypatch):
+    """If the order control never appears, nothing else may be pressed in its place."""
+    assert amazon.MAX_CHECKOUT_STEPS <= 8, "a bounded walk, not an open-ended one"
+
+
+def test_card_verification_is_reported_as_the_users_step(paths, monkeypatch):
+    """ISSUE-056. Live: Amazon blocked the payment step behind "Verify your card —
+    please re-enter your card number". Entering a card number is never done here, so
+    the wall is handed back rather than worked around."""
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        False, needs_card_verification=True,
+        detail="Amazon wants your card verified before it will accept this order.")))
+
+    reply = _run("1", paths)
+
+    assert "CARD VERIFIED" in reply
+    assert "never type card numbers" in reply
+    assert "one-time step per card" in reply
+    assert "Your list is untouched" in reply
+    assert len(workflow_store.get_workflow(USER, paths[1]).cart) == 1
+
+
+@pytest.mark.parametrize("text", [
+    "Verify your card", "Please re-enter your card number to verify this is an authorized use",
+    "Verify card",
+])
+def test_the_card_verification_wall_is_recognised(text):
+    assert amazon.CARD_VERIFICATION.search(text)
+
+
+def test_a_blocked_checkout_step_does_not_raise_a_raw_timeout():
+    """Live: a gated step kept its button in the DOM, so an unbounded click waited the
+    full 30s default and put a Playwright stack trace into the audit log."""
+    assert amazon.CHECKOUT_CLICK_TIMEOUT_MS <= 10_000
+
+
+# --------------------------------------------------------------------------
+# The real order control, mapped live on Amazon's review page
+# --------------------------------------------------------------------------
+
+def test_the_enabled_order_control_is_named_before_the_generic_one():
+    """Live: the review page renders several inputs with id="placeOrder", one of them
+    a disabled twin. Matching the id alone and taking the first hit can resolve to a
+    control that never submits."""
+    parts = [p.strip() for p in amazon.PLACE_ORDER_SELECTOR.split(",")]
+
+    assert parts[0].startswith('input[data-csa-c-slot-id="checkout-place-your-order-button"]')
+    assert 'data-testid="SPC_selectPlaceOrder"' in parts[0]
+    assert amazon.DISABLED_ORDER_TESTID not in amazon.PLACE_ORDER_SELECTOR
+
+
+def test_a_disabled_order_control_is_never_returned():
+    class _Control:
+        def __init__(self, testid, enabled):
+            self._testid, self._enabled = testid, enabled
+
+        async def get_attribute(self, name):
+            return self._testid if name == "data-testid" else None
+
+        async def is_enabled(self):
+            return self._enabled
+
+    class _Locator:
+        def __init__(self, controls):
+            self._controls = controls
+
+        async def count(self):
+            return len(self._controls)
+
+        def nth(self, index):
+            return self._controls[index]
+
+    class _Page:
+        def __init__(self, controls):
+            self._controls = controls
+
+        def locator(self, selector):
+            return _Locator(self._controls)
+
+    disabled = _Control(amazon.DISABLED_ORDER_TESTID, True)
+    not_enabled = _Control("SPC_selectPlaceOrder", False)
+    real = _Control("SPC_selectPlaceOrder", True)
+
+    assert asyncio.run(amazon._enabled_order_button(_Page([disabled, not_enabled, real]))) is real
+    assert asyncio.run(amazon._enabled_order_button(_Page([disabled, not_enabled]))) is None
+    assert asyncio.run(amazon._enabled_order_button(_Page([]))) is None

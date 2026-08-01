@@ -127,8 +127,7 @@ def candidate_facts(candidate: Candidate) -> str:
     $25.55 twin pack tells the user nothing until both are stated per ounce. Amazon's
     own figure is preferred; the pack-count division is a fallback.
     """
-    facts = [candidate.price_text or "price not shown"]
-    facts.append(_pack_fact(candidate))
+    facts = [candidate.price_text or "price not shown", _pack_fact(candidate)]
     if candidate.unit_price_text:
         facts.append(candidate.unit_price_text)
     else:
@@ -137,23 +136,19 @@ def candidate_facts(candidate: Candidate) -> str:
             facts.append(f"{unit:.2f} each".replace("0.", "$0.") if unit < 1 else f"${unit:.2f} each")
     if candidate.delivery_label:
         facts.append(f"arrives {candidate.delivery_label}")
-    return " · ".join(text(fact) for fact in facts)
+    return " · ".join(text(fact) for fact in facts if fact)
 
 
 def _pack_fact(candidate: Candidate) -> str:
-    """Always say how many the price buys, including when Amazon did not say.
+    """State the pack size when Amazon gave one, and say nothing when it did not.
 
-    A deodorant listing that states no count can be a single stick or a twelve-pack,
-    and the product page can raise the quantity further. Printing nothing let the user
-    compare a price against an unknown quantity; "count not stated" is the honest
-    version and is the cue to check before adding.
+    An absent count is the common case, so warning about it on most lines was noise
+    rather than signal. The variation picker is what actually protects the user here:
+    a listing whose count is chosen on the product page now asks which one before
+    anything is added (ADR-058).
     """
     count = ranking.pack_count(candidate.title)
-    if count:
-        return f"{count} in the pack"
-    if candidate.unit_price_text and "count" in candidate.unit_price_text.casefold():
-        return "count per Amazon's unit price"
-    return "⚠️ count not stated"
+    return f"{count} in the pack" if count else ""
 
 
 def candidate_line(number: int, candidate: Candidate, *, note: str = "") -> str:
@@ -405,6 +400,7 @@ def present_order_placed(
 def present_order_failed(
     summary, options: list[MenuOption], detail: str | None, *,
     needs_sign_in: bool = False, declined: bool = False,
+    needs_card_verification: bool = False,
 ) -> str:
     """The order did not happen, and the list is untouched.
 
@@ -412,7 +408,16 @@ def present_order_failed(
     nothing to act on. The list is stated as intact so nobody re-adds items they
     still have.
     """
-    if declined:
+    if needs_card_verification:
+        headline = "💳 <b>AMAZON WANTS YOUR CARD VERIFIED — NOTHING WAS ORDERED</b>"
+        guidance = (
+            "Amazon is asking for the full card number to be re-entered before it will "
+            "accept an order with that card. <b>I never type card numbers</b>, so this "
+            "one is yours: open your cart on Amazon, verify the card there, and then "
+            "check out again here. It is a one-time step per card, not something you "
+            "will have to repeat for every order."
+        )
+    elif declined:
         headline = "❌ <b>PAYMENT DECLINED — NOTHING WAS ORDERED</b>"
         guidance = (
             "Amazon would not accept the card on file. Update your payment method on "

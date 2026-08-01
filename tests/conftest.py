@@ -36,6 +36,19 @@ def no_real_amazon(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_ordering(monkeypatch):
+    """No test may place an order, whatever the developer's .env says.
+
+    `load_dotenv()` loads the real .env into the test process, so switching ordering
+    on for live testing silently switched it on inside pytest too. Nothing did place
+    an order — the browser blocker above stops that — but the suite's behaviour
+    changed with a config value, which is exactly what a test must never do.
+    """
+    monkeypatch.setenv("AMAZON_ENABLE_ORDERING", "false")
+    monkeypatch.setenv("AMAZON_MAX_ORDER_TOTAL", "100")
+
+
+@pytest.fixture(autouse=True)
 def no_real_model(monkeypatch):
     """No test may reach LM Studio.
 

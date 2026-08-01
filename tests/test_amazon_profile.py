@@ -196,7 +196,13 @@ def test_review_count_comes_from_the_accessibility_label():
     assert review_count == 212162
 
 
-def test_prime_is_not_claimed_when_amazon_shows_a_join_prime_upsell():
+def test_a_membership_upsell_does_not_strip_a_products_prime_badge():
+    """Superseded by ADR-065. The badge is a fact about the *product* — this listing
+    ships under Prime — while a "Join Prime" advert beside it is a fact about the
+    *account*. Conflating them was cosmetic while Prime was only displayed; it
+    silently drops genuinely eligible results now that Prime is a hard filter on
+    everything the agent suggests.
+    """
     html = (
         '<div data-asin="B0P"><a class="a-link-normal s-line-clamp-3" href="/dp/B0P">'
         '<span>Item</span></a><i class="a-icon-prime"></i>'
@@ -205,7 +211,7 @@ def test_prime_is_not_claimed_when_amazon_shows_a_join_prime_upsell():
 
     _, _, _, prime = amazon._result_metadata_from_html(html)
 
-    assert prime is None
+    assert prime is True
 
 
 def test_delivery_date_survives_the_tags_between_label_and_date():
@@ -279,7 +285,7 @@ def test_a_transient_search_failure_is_retried_once(monkeypatch):
         attempts["count"] += 1
         if attempts["count"] == 1:
             raise amazon.AmazonSearchUnavailable("timeout")
-        return [amazon.Product("Thing", "$1.00", "https://www.amazon.com/dp/x")]
+        return [amazon.Product("Thing", "$1.00", "https://www.amazon.com/dp/x", prime_eligible=True)]
 
     monkeypatch.setattr(amazon, "_persistent_browser_context", lambda **kw: Manager())
     monkeypatch.setattr(amazon, "_search_in_context", flaky)

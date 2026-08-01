@@ -219,12 +219,15 @@ async def _execute_menu_choice(
                 workflow, option.payload.removeprefix(AMAZON_CART_PREFIX), workflow_database_path
             )
         if option.payload:
+            note = await _drop_from_amazon_cart_if_present(workflow, option.payload)
             workflow.cart = cart.remove(workflow.cart, option.payload)
             workflow.confirmed_token = None
             workflow_store.transition(
                 workflow, WorkflowState.PREPARING_CART, pending_question="Anything else?"
             )
-            return _show_cart(workflow, workflow_database_path)
+            return f"{note}{_show_cart(workflow, workflow_database_path)}" if note else _show_cart(
+                workflow, workflow_database_path
+            )
         options = flow.store(workflow, flow.remove_menu(workflow))
         workflow_store.save_workflow(workflow, workflow_database_path)
         return "Which item should I remove?\n\n" + flow.render_only(options, "Choose:")
@@ -380,7 +383,8 @@ async def _search_again(
         print(f"Amazon re-search error: {error}")
         return None
 
-    candidates = ranking.relevance(_candidates_from_products(products), query).kept
+    candidates = ranking.prime_only(_candidates_from_products(products)).kept
+    candidates = ranking.relevance(candidates, query).kept
     outcome = ranking.apply_constraints(candidates, constraints)
     if not outcome.kept:
         return None
@@ -797,6 +801,36 @@ async def _push_to_amazon_cart(workflow: PurchaseWorkflow) -> str:
 
 
 AMAZON_CART_PREFIX = "amazon-cart:"
+
+
+async def _drop_from_amazon_cart_if_present(
+    workflow: PurchaseWorkflow, candidate_id: str
+) -> str:
+    """Take an item out of the real Amazon cart when checkout already put it there.
+
+    Removing from the list used to touch only the agent's own copy, so an item the
+    user had just deleted stayed in the Amazon cart and would still have been bought.
+    The list and the cart have to mean the same thing once checkout has run.
+    """
+    asin = candidate_id.removeprefix("amazon-") if candidate_id.startswith("amazon-") else None
+    if not asin:
+        return ""
+    in_amazon_cart = any(
+        len(row) > 3 and row[3] == asin for row in workflow.amazon_cart
+    )
+    if not in_amazon_cart:
+        return ""
+    try:
+        await amazon.remove_from_cart(asin)
+    except Exception as error:  # noqa: BLE001 - report, never raise into a reply
+        return (
+            "⚠️ I removed it from your list but could not remove it from your Amazon "
+            f"cart ({str(error)[:80]}). Remove it on Amazon so it is not ordered.\n\n"
+        )
+    workflow.amazon_cart = [
+        row for row in workflow.amazon_cart if not (len(row) > 3 and row[3] == asin)
+    ]
+    return "Removed from your list and from your Amazon cart.\n\n"
 
 
 async def _remove_from_amazon_cart(
@@ -1223,6 +1257,15 @@ async def _start_purchase_workflow(
 
     # Amazon mixes unrelated placements into organic results, so anything sharing no
     # word with the request is dropped before the user ever sees a number beside it.
+    # Never suggest something that cannot ship free (ADR-065).
+    prime = ranking.prime_only(candidates)
+    if not prime.kept:
+        return (
+            f"Nothing Amazon returned for <b>{product_display.text(goal)}</b> is Prime "
+            "eligible, so I have nothing worth suggesting. Try different wording, or "
+            "search for it on Amazon directly."
+        )
+    candidates = prime.kept
     relevant = ranking.relevance(candidates, goal)
     # Amazon answers any string, so a sentence it could not parse still returns real
     # listings — "6 dont want to pay over 10 bucks" came back with "A Smell of Honey,

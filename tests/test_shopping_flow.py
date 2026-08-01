@@ -17,7 +17,7 @@ USER = 21
 def _products():
     return [
         amazon.Product("Duracell Coppertop AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/a", 4.7, 1200, prime_eligible=True),
-        amazon.Product("Energizer MAX AA Batteries, 16 Count", "$12.00", "https://www.amazon.com/dp/b", 4.5, 900),
+        amazon.Product("Energizer MAX AA Batteries, 16 Count", "$12.00", "https://www.amazon.com/dp/b", 4.5, 900, prime_eligible=True),
     ]
 
 

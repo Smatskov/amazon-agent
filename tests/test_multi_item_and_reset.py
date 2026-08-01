@@ -20,15 +20,15 @@ def paths(tmp_path):
 
 
 def _shampoo():
-    return [amazon.Product("Head and Shoulders Shampoo, 28.2 fl oz", "$12.47", "https://www.amazon.com/dp/h1", 4.8, 1467)]
+    return [amazon.Product("Head and Shoulders Shampoo, 28.2 fl oz", "$12.47", "https://www.amazon.com/dp/h1", 4.8, 1467, prime_eligible=True)]
 
 
 def _towels():
-    return [amazon.Product("Bounty Paper Towels, 8 Rolls", "$21.99", "https://www.amazon.com/dp/p1", 4.7, 90000)]
+    return [amazon.Product("Bounty Paper Towels, 8 Rolls", "$21.99", "https://www.amazon.com/dp/p1", 4.7, 90000, prime_eligible=True)]
 
 
 def _batteries():
-    return [amazon.Product("Duracell AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/b1", 4.7, 1200)]
+    return [amazon.Product("Duracell AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/b1", 4.7, 1200, prime_eligible=True)]
 
 
 def _run(message, paths, user=USER):

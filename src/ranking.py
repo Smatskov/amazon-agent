@@ -353,6 +353,22 @@ def relevance(candidates: list[Candidate], query: str) -> FilterOutcome:
     return FilterOutcome(kept, removed, ("unrelated to your search",) if removed else ())
 
 
+def prime_only(candidates: list[Candidate]) -> FilterOutcome:
+    """Keep only results Amazon badges as Prime eligible.
+
+    A product that cannot ship free is never worth suggesting, so this is a hard rule
+    on everything the agent offers rather than a preference the user has to restate.
+    It applies to suggestions only: something already sitting in the Amazon cart is
+    reported as it is, because hiding it would misrepresent what an order would buy.
+
+    Nothing is inferred. `prime_eligible` is True only where the search card carried
+    Amazon's own Prime badge; a result with no badge is dropped rather than guessed at.
+    """
+    kept = [candidate for candidate in candidates if candidate.prime_eligible is True]
+    removed = len(candidates) - len(kept)
+    return FilterOutcome(kept, removed, ("not Prime eligible",) if removed else ())
+
+
 def apply_constraints(
     candidates: list[Candidate], constraints: dict | None
 ) -> FilterOutcome:

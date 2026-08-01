@@ -34,9 +34,9 @@ def _run(message, paths, user=USER):
 
 def _presses():
     return [
-        amazon.Product("QUQIYSO French Press Coffee Maker 21oz, Copper", "$17.99", "https://www.amazon.com/dp/q1", 4.6, 10994, delivery="Mon, Aug 3"),
-        amazon.Product("Bodum 34oz Brazil French Press Coffee Maker, Black", "$19.99", "https://www.amazon.com/dp/b1", 4.5, 19914, delivery="Mon, Aug 3"),
-        amazon.Product("Veken French Press Coffee Maker 34oz Stainless", "$24.99", "https://www.amazon.com/dp/v1", 4.4, 5000, delivery="Wed, Aug 5"),
+        amazon.Product("QUQIYSO French Press Coffee Maker 21oz, Copper", "$17.99", "https://www.amazon.com/dp/q1", 4.6, 10994, delivery="Mon, Aug 3", prime_eligible=True),
+        amazon.Product("Bodum 34oz Brazil French Press Coffee Maker, Black", "$19.99", "https://www.amazon.com/dp/b1", 4.5, 19914, delivery="Mon, Aug 3", prime_eligible=True),
+        amazon.Product("Veken French Press Coffee Maker 34oz Stainless", "$24.99", "https://www.amazon.com/dp/v1", 4.4, 5000, delivery="Wed, Aug 5", prime_eligible=True),
     ]
 
 

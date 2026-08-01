@@ -36,24 +36,24 @@ def _melatonin():
     """The exact result set the user was shown, ad included."""
     return [
         amazon.Product("One Medical Membership: Get 24/7 on-demand care for 50+ conditions and more",
-                       "$99.00", "https://www.amazon.com/dp/B0CZYRCB2B"),
+                       "$99.00", "https://www.amazon.com/dp/B0CZYRCB2B", prime_eligible=True),
         amazon.Product("Natrol Melatonin 10 mg Fast Dissolve Tablets, Strawberry, 100 Count",
-                       "$10.36", "https://www.amazon.com/dp/B01E14X7SM", 4.6, 90000, delivery="Mon, Aug 3"),
+                       "$10.36", "https://www.amazon.com/dp/B01E14X7SM", 4.6, 90000, delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Nature Made Melatonin 10mg Maximum Strength for Sleep Support, 70 Tablets",
-                       "$13.99", "https://www.amazon.com/dp/B085V63SWW", 4.7, 40000, delivery="Mon, Aug 3"),
+                       "$13.99", "https://www.amazon.com/dp/B085V63SWW", 4.7, 40000, delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Natrol Melatonin 10 mg Gummies, 140 Gummies, Strawberry-flavored",
-                       "$15.56", "https://www.amazon.com/dp/B08666GMWG", 4.5, 30000, delivery="Mon, Aug 3"),
+                       "$15.56", "https://www.amazon.com/dp/B08666GMWG", 4.5, 30000, delivery="Mon, Aug 3", prime_eligible=True),
     ]
 
 
 def _toothbrushes():
     return [
         amazon.Product("Oral-B Pro Clean CrossAction Manual Toothbrush, 6- Pack",
-                       "$17.99", "https://www.amazon.com/dp/B01KZ6V00W", 4.6, 300, delivery="Mon, Aug 3"),
+                       "$17.99", "https://www.amazon.com/dp/B01KZ6V00W", 4.6, 300, delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Oral-B Complete Sensitive Toothbrush, 35 Extra Soft - Pack of 4",
-                       "$13.46", "https://www.amazon.com/dp/B0BBPB6HV9", 4.4, 200, delivery="Mon, Aug 3"),
+                       "$13.46", "https://www.amazon.com/dp/B0BBPB6HV9", 4.4, 200, delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Colgate Extra Clean Full Head Toothbrush, Soft, 6 Pack",
-                       "$4.96", "https://www.amazon.com/dp/B00CC6XSSQ", 4.5, 5000, delivery="Mon, Aug 3"),
+                       "$4.96", "https://www.amazon.com/dp/B00CC6XSSQ", 4.5, 5000, delivery="Mon, Aug 3", prime_eligible=True),
     ]
 
 
@@ -227,7 +227,7 @@ def test_a_budget_is_sent_to_amazon_not_just_applied_locally(paths, monkeypatch)
     washes from $5.47 — because the re-search asked for the same unfiltered page."""
     search = AsyncMock(return_value=[
         amazon.Product("Dove Body Wash Deep Moisture, 30.6 oz", "$10.97",
-                       "https://www.amazon.com/dp/B00MEDOY2G", delivery="Mon, Aug 3"),
+                       "https://www.amazon.com/dp/B00MEDOY2G", delivery="Mon, Aug 3", prime_eligible=True),
     ])
     monkeypatch.setattr(agent.amazon, "search_products", search)
 
@@ -235,7 +235,7 @@ def test_a_budget_is_sent_to_amazon_not_just_applied_locally(paths, monkeypatch)
     _run("2", paths)  # Narrow (only one product, so the action sits at 2)
     search.return_value = [
         amazon.Product("Dove Men+Care Micro Moisture Body and Face Wash, 13.5 fl oz", "$5.47",
-                       "https://www.amazon.com/dp/B07CV1234X", delivery="Mon, Aug 3"),
+                       "https://www.amazon.com/dp/B07CV1234X", delivery="Mon, Aug 3", prime_eligible=True),
     ]
     reply = _run("under 10", paths)
 
@@ -262,7 +262,7 @@ def test_narrowing_by_brand_asks_amazon_for_that_brand(paths, monkeypatch):
     _run("4", paths)  # Narrow these results
     search.return_value = [
         amazon.Product("Nature's Bounty Melatonin 10mg, 180 Tablets", "$9.49",
-                       "https://www.amazon.com/dp/NB1", 4.6, 5000, delivery="Mon, Aug 3"),
+                       "https://www.amazon.com/dp/NB1", 4.6, 5000, delivery="Mon, Aug 3", prime_eligible=True),
     ]
     reply = _run("natures bounty", paths)
 
@@ -403,11 +403,11 @@ def test_five_dove_listings_are_told_apart(paths, monkeypatch):
     same product repeated. Live-verified: the titles differ; only extraction failed."""
     dove = [
         amazon.Product("Dove 24hr Lotion Body Wash Deep Moisture, 30.6 oz | Moisturizing body wash",
-                       "$10.97", "https://www.amazon.com/dp/B00MEDOY2G", delivery="Mon, Aug 3"),
+                       "$10.97", "https://www.amazon.com/dp/B00MEDOY2G", delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Dove 24hr Lotion Body Wash Sensitive Skin with Pump, 30.6 oz | Hypoallergenic",
-                       "$10.97", "https://www.amazon.com/dp/B00SK71SAG", delivery="Mon, Aug 3"),
+                       "$10.97", "https://www.amazon.com/dp/B00SK71SAG", delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Dove 24hr Lotion Antibacterial Body Wash with Pump, 30.6 oz | Eliminates 99%",
-                       "$10.97", "https://www.amazon.com/dp/B09DDD6YGJ", delivery="Mon, Aug 3"),
+                       "$10.97", "https://www.amazon.com/dp/B09DDD6YGJ", delivery="Mon, Aug 3", prime_eligible=True),
     ]
     monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=dove))
 
@@ -515,9 +515,9 @@ def test_an_item_the_agent_did_not_add_is_reported_at_confirmation(paths, monkey
     an earlier session rode along unmentioned."""
     reply = _confirm_flow(paths, monkeypatch, [
         amazon.Product("Colgate Extra Clean Full Head Toothbrush, Soft, 6 Pack", "$4.96",
-                       "https://www.amazon.com/dp/B00CC6XSSQ"),
+                       "https://www.amazon.com/dp/B00CC6XSSQ", prime_eligible=True),
         amazon.Product("Amazon Basics Basket Coffee Filters, 200 Count", "$1.98",
-                       "https://www.amazon.com/dp/B00LM4M5FS"),
+                       "https://www.amazon.com/dp/B00LM4M5FS", prime_eligible=True),
     ])
 
     assert "ALREADY IN YOUR CART" in reply
@@ -527,7 +527,7 @@ def test_an_item_the_agent_did_not_add_is_reported_at_confirmation(paths, monkey
 def test_a_cart_holding_only_our_items_is_not_flagged(paths, monkeypatch):
     reply = _confirm_flow(paths, monkeypatch, [
         amazon.Product("Colgate Extra Clean Full Head Toothbrush, Soft, 6 Pack", "$4.96",
-                       "https://www.amazon.com/dp/B00CC6XSSQ"),
+                       "https://www.amazon.com/dp/B00CC6XSSQ", prime_eligible=True),
     ])
 
     assert "ALREADY IN YOUR CART" not in reply
@@ -611,7 +611,7 @@ def test_choosing_a_version_adds_that_exact_child_asin(paths, monkeypatch):
     monkeypatch.setattr(agent.amazon, "read_variants", AsyncMock(return_value=_variants()))
     monkeypatch.setattr(agent.amazon, "read_product", AsyncMock(return_value=amazon.Product(
         "Old Spice High Endurance, Swagger, 3.8 oz, Pack of 3", "$12.97",
-        "https://www.amazon.com/dp/B09NPNPKGS")))
+        "https://www.amazon.com/dp/B09NPNPKGS", prime_eligible=True)))
 
     _run("toothbrush", paths)
     _run("1", paths)
@@ -848,9 +848,9 @@ def test_a_stray_amazon_cart_item_can_be_removed(paths, monkeypatch):
                         AsyncMock(return_value=amazon.Destination(None, None)))
     monkeypatch.setattr(agent.amazon, "read_cart", AsyncMock(return_value=[
         amazon.Product("Colgate Extra Clean Full Head Toothbrush, Soft, 6 Pack", "$4.96",
-                       "https://www.amazon.com/dp/B00CC6XSSQ"),
+                       "https://www.amazon.com/dp/B00CC6XSSQ", prime_eligible=True),
         amazon.Product("SUPFINE Magnetic for iPhone 17 Pro Case Forest Green", "$14.99",
-                       "https://www.amazon.com/dp/BCASE001"),
+                       "https://www.amazon.com/dp/BCASE001", prime_eligible=True),
     ]))
     remove = AsyncMock(return_value=1)
     monkeypatch.setattr(agent.amazon, "remove_from_cart", remove)
@@ -1001,3 +1001,55 @@ def test_a_disabled_order_control_is_never_returned():
     assert asyncio.run(amazon._enabled_order_button(_Page([disabled, not_enabled, real]))) is real
     assert asyncio.run(amazon._enabled_order_button(_Page([disabled, not_enabled]))) is None
     assert asyncio.run(amazon._enabled_order_button(_Page([]))) is None
+
+
+# --------------------------------------------------------------------------
+# Prime eligibility is a hard rule on everything the agent suggests
+# --------------------------------------------------------------------------
+
+def _prime(flag):
+    return Candidate(candidate_id=f"c{flag}", title="Coffee Filters 200 Count", brand=None,
+                     price=1.98, prime_eligible=flag)
+
+
+def test_only_prime_eligible_results_are_ever_suggested():
+    """ISSUE-057. A product that cannot ship free is never worth suggesting."""
+    outcome = ranking.prime_only([_prime(True), _prime(False), _prime(None)])
+
+    assert [c.prime_eligible for c in outcome.kept] == [True]
+    assert outcome.removed == 2
+    assert "not Prime eligible" in outcome.reasons
+
+
+def test_prime_eligibility_is_never_inferred():
+    """Absent evidence is not evidence: a card with no badge is dropped, not guessed."""
+    assert ranking.prime_only([_prime(None)]).kept == []
+
+
+def test_a_search_with_no_prime_results_suggests_nothing(paths, monkeypatch):
+    monkeypatch.setattr(agent.amazon, "search_products", AsyncMock(return_value=[
+        amazon.Product("Coffee Filters, 600 Pack", "$9.49",
+                       "https://www.amazon.com/dp/BNOPRIME", delivery="Mon, Aug 3"),
+    ]))
+
+    reply = _run("coffee filters", paths)
+
+    assert "Prime eligible" in reply
+    assert "BNOPRIME" not in reply
+    assert workflow_store.get_active_workflow(USER, paths[1]) is None
+
+
+def test_a_membership_upsell_does_not_strip_a_products_prime_badge():
+    """The badge is a fact about the product; a "Join Prime" advert beside it is a
+    fact about the account. Conflating them dropped genuinely eligible results."""
+    html = '<i class="a-icon a-icon-prime"></i><span>Join Prime to get FREE delivery</span>'
+
+    _, _, _, prime = amazon._result_metadata_from_html(html)
+
+    assert prime is True
+
+
+def test_the_free_delivery_matcher_ignores_a_priced_option():
+    assert amazon.FREE_DELIVERY.search("FREE Delivery Wednesday, August 5")
+    assert amazon.PAID_DELIVERY.search("$6.99 - Tuesday, August 4")
+    assert not amazon.PAID_DELIVERY.search("FREE Delivery Wednesday, August 5")

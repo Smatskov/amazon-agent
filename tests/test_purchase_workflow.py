@@ -14,7 +14,7 @@ def _products():
         amazon.Product("Duracell Coppertop AA Batteries, 24 Count", "$18.49",
                        "https://www.amazon.com/dp/example-aa", 4.7, 1200, prime_eligible=True),
         amazon.Product("Amazon Basics AA Batteries, 20 Count", "$11.99",
-                       "https://www.amazon.com/dp/example-basics", 4.5, 900),
+                       "https://www.amazon.com/dp/example-basics", 4.5, 900, prime_eligible=True),
     ]
 
 

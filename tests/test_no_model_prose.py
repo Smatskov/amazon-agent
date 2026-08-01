@@ -32,9 +32,9 @@ SHOPPING_MESSAGES = [
 def _products():
     return [
         amazon.Product("OFF! Deep Woods Insect Repellent, 6 oz", "$5.92",
-                       "https://www.amazon.com/dp/o1", 4.6, 30000, delivery="Mon, Aug 3"),
+                       "https://www.amazon.com/dp/o1", 4.6, 30000, delivery="Mon, Aug 3", prime_eligible=True),
         amazon.Product("Cutter Backwoods Insect Repellent, 6 oz", "$4.88",
-                       "https://www.amazon.com/dp/c1", 4.7, 15000, delivery="Tue, Aug 4"),
+                       "https://www.amazon.com/dp/c1", 4.7, 15000, delivery="Tue, Aug 4", prime_eligible=True),
     ]
 
 

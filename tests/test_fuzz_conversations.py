@@ -45,11 +45,11 @@ USER_MESSAGES = [
 ROUTES = ["memory", "purchase", "workflow", "general_chat", "unknown"]
 
 CATALOGUE = [
-    amazon.Product("Head and Shoulders Classic Clean Shampoo, 28.2 fl oz", "$12.47", "https://www.amazon.com/dp/h1", 4.8, 1467, delivery="Tue, Aug 4"),
-    amazon.Product("Dove Daily Moisture Shampoo, 12 fl oz", "$5.99", "https://www.amazon.com/dp/d1", 4.6, 22000, delivery="Wed, Aug 5"),
-    amazon.Product("Duracell Coppertop AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/b1", 4.7, 210000, delivery=None),
-    amazon.Product("Mystery Item With No Price", None, "https://www.amazon.com/dp/m1", None, None),
-    amazon.Product("Jockey Men's Crew Neck T-Shirt, White, Medium, 3 Pack", "$29.99", "https://www.amazon.com/dp/t1", 4.6, 8921, delivery="Fri, Aug 7"),
+    amazon.Product("Head and Shoulders Classic Clean Shampoo, 28.2 fl oz", "$12.47", "https://www.amazon.com/dp/h1", 4.8, 1467, delivery="Tue, Aug 4", prime_eligible=True),
+    amazon.Product("Dove Daily Moisture Shampoo, 12 fl oz", "$5.99", "https://www.amazon.com/dp/d1", 4.6, 22000, delivery="Wed, Aug 5", prime_eligible=True),
+    amazon.Product("Duracell Coppertop AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/b1", 4.7, 210000, delivery=None, prime_eligible=True),
+    amazon.Product("Mystery Item With No Price", None, "https://www.amazon.com/dp/m1", None, None, prime_eligible=True),
+    amazon.Product("Jockey Men's Crew Neck T-Shirt, White, Medium, 3 Pack", "$29.99", "https://www.amazon.com/dp/t1", 4.6, 8921, delivery="Fri, Aug 7", prime_eligible=True),
 ]
 
 

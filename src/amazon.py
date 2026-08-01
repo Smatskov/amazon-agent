@@ -254,8 +254,9 @@ DELIVERY_DATE = re.compile(
     r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2})"
 )
-# A "Join Prime" upsell means this account is not a Prime member, so a Prime badge
-# would be misleading rather than helpful.
+# Retained for the delivery copy: a "Join Prime" upsell tells us the account is not a
+# member, which changes what free delivery costs the user — but not whether the
+# product itself is Prime eligible.
 PRIME_UPSELL = re.compile(r"join prime", re.IGNORECASE)
 # Amazon's own per-unit price, e.g. "($2.27/fluid ounce)" or "($0.83/count)". Copied
 # verbatim rather than computed: dividing a price by a size read out of a title would
@@ -279,7 +280,12 @@ def _result_metadata_from_html(html: str) -> tuple[str | None, float | None, int
         if ratings
         else _review_count_from_text(parser.first_value("review_count"))
     )
-    prime = True if parser.prime_eligible and not PRIME_UPSELL.search(html) else None
+    # The badge is a fact about the *product*: this listing ships under Prime. A
+    # "Join Prime" upsell on the same card is a fact about the *account*, and the two
+    # were conflated, so a genuinely Prime-eligible product lost its badge whenever
+    # Amazon happened to advertise membership beside it. That was cosmetic while Prime
+    # was only displayed; it silently drops real results now that it is a hard filter.
+    prime = True if parser.prime_eligible else None
     return (
         parser.first_matching("price", PRICE_SHAPED),
         _rating_from_text(parser.first_value("rating")),
@@ -963,6 +969,11 @@ NEVER_CLICK = re.compile(
     re.IGNORECASE,
 )
 MAX_CHECKOUT_STEPS = 6
+# Delivery-speed radios on the shipping step. Amazon preselects a speed that is not
+# always the free one, and a paid upgrade would be spent without ever being shown.
+DELIVERY_OPTION_SELECTOR = 'input[type="radio"][name*="Ordering"], #shipping-option-form input[type="radio"]'
+FREE_DELIVERY = re.compile(r"\bfree\b", re.IGNORECASE)
+PAID_DELIVERY = re.compile(r"\$\s*\d+\.\d{2}")
 # Amazon can require the full card number to be re-entered before it will accept an
 # order with that card. This application never types a card number, so the wall is
 # reported to the user rather than worked around. It is a one-time step per card.
@@ -998,6 +1009,78 @@ class OrderResult:
     needs_sign_in: bool = False
     declined: bool = False
     needs_card_verification: bool = False
+
+
+async def _choose_free_fastest_delivery(page) -> str | None:
+    """Select the free delivery option that arrives soonest, if a choice is offered.
+
+    Amazon's preselected speed is not always the free one, so leaving the default
+    could add a shipping charge the user never chose. Only options whose own label
+    says "FREE" and states no price are eligible; among those the earliest stated
+    date wins. If no label can be read, nothing is touched — a guess here costs money.
+    """
+    radios = page.locator(DELIVERY_OPTION_SELECTOR)
+    count = await radios.count()
+    if count < 2:
+        return None
+
+    best = None
+    for index in range(min(count, 8)):
+        radio = radios.nth(index)
+        try:
+            label_id = await radio.get_attribute("aria-labelledby") or ""
+            text = ""
+            for part in label_id.split():
+                node = page.locator(f"#{part}").first
+                if await node.count():
+                    text += " " + ((await node.inner_text()) or "")
+            text = " ".join(text.split())
+            if not text or PAID_DELIVERY.search(text) or not FREE_DELIVERY.search(text):
+                continue
+            days = _delivery_days_from_text(text)
+            if best is None or (days is not None and days < best[0]):
+                best = (days if days is not None else 10_000, radio, text)
+        except Exception:  # noqa: BLE001 - an unreadable option is simply not chosen
+            continue
+
+    if best is None:
+        return None
+    try:
+        await best[1].check(timeout=CHECKOUT_CLICK_TIMEOUT_MS)
+    except Exception as error:  # noqa: BLE001
+        print(f"[AMAZON] could not select the free delivery option: {str(error)[:80]}")
+        return None
+    return best[2][:60]
+
+
+def _delivery_days_from_text(text: str) -> int | None:
+    """Days until the date an option states, so "soonest" is a fact not an assumption."""
+    from datetime import date as _date
+
+    match = DELIVERY_DATE.search(text) or DELIVERY_PARTS_FALLBACK.search(text)
+    if not match:
+        return None
+    raw = match.group(1) if match.lastindex else match.group(0)
+    parts = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})",
+                      raw, re.IGNORECASE)
+    if not parts:
+        return None
+    months = {n: i for i, n in enumerate(
+        "jan feb mar apr may jun jul aug sep oct nov dec".split(), start=1)}
+    today = _date.today()
+    for year in (today.year, today.year + 1):
+        try:
+            when = _date(year, months[parts.group(1).casefold()], int(parts.group(2)))
+        except ValueError:
+            return None
+        if when >= today:
+            return (when - today).days
+    return None
+
+
+DELIVERY_PARTS_FALLBACK = re.compile(
+    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2})", re.IGNORECASE
+)
 
 
 async def _enabled_order_button(page):
@@ -1138,6 +1221,10 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
                         return OrderResult(False, detail="Refusing to accept a paid Amazon offer.")
                     await _click_step(page, decline)
                     continue
+
+                chosen = await _choose_free_fastest_delivery(page)
+                if chosen:
+                    _audit(f"DELIVERY selected free/fastest: {chosen}")
 
                 advance = page.locator(CHECKOUT_CONTINUE_SELECTOR).first
                 if await advance.count():

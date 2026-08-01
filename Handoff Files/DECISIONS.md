@@ -2106,3 +2106,76 @@ Consequences:
 
 - The browser blocker is no longer the only thing standing between the test suite and
   a real order; the kill switch is independently forced off.
+
+---
+
+## ADR-065 — Only Prime-Eligible Products Are Ever Suggested
+
+Status: Accepted and implemented
+
+Decision:
+
+Every product the agent offers must carry Amazon's Prime badge. Non-eligible results
+are dropped from search and from re-search before ranking. If nothing eligible is
+found, the agent says so and suggests nothing rather than offering a product that
+cannot ship free.
+
+Two exceptions, both deliberate: items already sitting in the real Amazon cart are
+reported exactly as they are, because hiding one would misrepresent what an order
+would buy; and a future re-buy workflow will need the same latitude for something the
+user has already chosen.
+
+Reasoning:
+
+- A product that cannot ship free is not worth the user's attention, so this belongs
+  in code as a rule rather than as a preference they restate every search.
+- Eligibility is never inferred. `prime_eligible` is True only where the result card
+  carried the badge; no badge means dropped, not guessed.
+
+Related fix — the badge is about the product, not the account:
+
+`_result_metadata_from_html()` previously cleared the badge whenever a "Join Prime"
+upsell appeared on the same card. Those are different facts: the badge says *this
+listing ships under Prime*, the upsell says *this account is not a member*. Conflating
+them was cosmetic while Prime was only displayed, and silently drops genuinely
+eligible results the moment it becomes a filter.
+
+---
+
+## ADR-066 — Delivery Is Always the Free Option That Arrives Soonest
+
+Status: Accepted and implemented
+
+Decision:
+
+When Amazon's checkout offers a choice of delivery speed, the agent selects the
+fastest option whose own label says FREE and states no price. If no label can be read,
+nothing is touched and Amazon's default stands.
+
+Reasoning:
+
+- Amazon's preselected speed is not always the free one, so accepting the default
+  could spend money on shipping that the user never chose and never saw.
+- Only the option's own text is trusted: an option is eligible when its label says
+  "FREE" and contains no price, and "soonest" is decided by the date it states.
+- Doing nothing is the correct fallback. A guess between delivery options is a guess
+  about a charge.
+
+---
+
+## ADR-067 — Removing From the List Removes From the Amazon Cart
+
+Status: Accepted and implemented; closes ISSUE-017
+
+Decision:
+
+Removing an item from the agent's list also removes it from the real Amazon cart when
+checkout has already put it there. A failed removal is reported and the item is not
+shown as gone.
+
+Context:
+
+Checkout writes the list into the real cart (ADR-059). Removal only ever touched the
+agent's own copy, so an item the user had just deleted stayed in the Amazon cart and
+would still have been bought. The list and the cart have to mean the same thing once
+checkout has run.

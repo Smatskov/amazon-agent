@@ -41,9 +41,9 @@ def _candidate(index=1, title="AA Batteries, 4 Count", price=10.0, rating=None, 
 
 def _products(count=3):
     return [
-        amazon.Product("Duracell Coppertop AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/a", 4.7, 1200, delivery="Tue, Aug 4"),
-        amazon.Product("Energizer MAX AA Batteries, 16 Count", "$12.00", "https://www.amazon.com/dp/b", 4.5, 900),
-        amazon.Product("Rayovac AA Batteries, 4 Count", "$5.99", "https://www.amazon.com/dp/c", 4.2, 30),
+        amazon.Product("Duracell Coppertop AA Batteries, 24 Count", "$18.49", "https://www.amazon.com/dp/a", 4.7, 1200, delivery="Tue, Aug 4", prime_eligible=True),
+        amazon.Product("Energizer MAX AA Batteries, 16 Count", "$12.00", "https://www.amazon.com/dp/b", 4.5, 900, prime_eligible=True),
+        amazon.Product("Rayovac AA Batteries, 4 Count", "$5.99", "https://www.amazon.com/dp/c", 4.2, 30, prime_eligible=True),
     ][:count]
 
 
@@ -125,7 +125,7 @@ INJECTION_TITLES = [
 @pytest.mark.parametrize("title", INJECTION_TITLES)
 def test_untrusted_titles_are_data_not_instructions(title, paths, monkeypatch):
     """Amazon titles are attacker-controlled and must never change agent behaviour."""
-    products = [amazon.Product(title, "$9.99", "https://www.amazon.com/dp/inj", 4.0, 10)]
+    products = [amazon.Product(title, "$9.99", "https://www.amazon.com/dp/inj", 4.0, 10, prime_eligible=True)]
     generate = AsyncMock(return_value="Here are the details.")
 
     replies = _drive(paths, monkeypatch, ["widget", "1", "checkout", "place the order"], products=products)

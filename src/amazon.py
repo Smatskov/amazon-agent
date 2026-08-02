@@ -139,6 +139,71 @@ def _audit(event: str) -> None:
         print(f"[AMAZON] could not write the order audit log: {error}")
 
 
+CHECKOUT_TRACE_DIR = Path(
+    os.getenv("AMAZON_CHECKOUT_TRACE_DIR",
+              str(Path.home() / "Library" / "Application Support" / "Amazon Agent" / "checkout-traces"))
+)
+
+
+class _CheckoutTrace:
+    """Record what checkout actually looked like at every step of one attempt.
+
+    An order attempt is rare, consequential, and hard to reproduce: Amazon's pipeline
+    varies by account, cart, and the state of the card. Reconstructing a failure from
+    a one-line error afterwards has already cost several rounds this build, so each
+    attempt writes a screenshot and a structured note per step instead.
+
+    Nothing here can fail an order: every method swallows its own errors.
+    """
+
+    def __init__(self) -> None:
+        self.directory: Path | None = None
+        self.step = 0
+        try:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            self.directory = CHECKOUT_TRACE_DIR / stamp
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except Exception as error:  # noqa: BLE001
+            print(f"[TRACE] could not open a trace directory: {error}")
+
+    async def record(self, page, label: str, **facts) -> None:
+        if self.directory is None:
+            return
+        self.step += 1
+        try:
+            facts = {"step": self.step, "label": label, "url": page.url[:200], **facts}
+            try:
+                facts["title"] = (await page.title())[:120]
+            except Exception:  # noqa: BLE001
+                pass
+            import json as _json
+            with (self.directory / "trace.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(_json.dumps(facts) + "\n")
+            print(f"[TRACE] {self.step:02d} {label} :: {facts.get('title', '')[:60]}")
+            await page.screenshot(path=str(self.directory / f"{self.step:02d}-{label}.png"),
+                                  full_page=False, timeout=10_000)
+        except Exception as error:  # noqa: BLE001 - tracing must never break an order
+            print(f"[TRACE] step {self.step} not captured: {str(error)[:80]}")
+
+    async def controls(self, page) -> None:
+        """Every visible control on this step, so a missing selector is diagnosable."""
+        if self.directory is None:
+            return
+        try:
+            found = await page.evaluate("""() => [...document.querySelectorAll('input,button,a[role=button]')]
+                .map(e => ({tag:e.tagName, id:e.id||null, testid:e.getAttribute('data-testid'),
+                            name:(e.getAttribute('name')||'').slice(0,60),
+                            slot:(e.getAttribute('data-csa-c-slot-id')||''),
+                            value:(e.value||'').slice(0,50),
+                            text:(e.innerText||'').replace(/\\s+/g,' ').trim().slice(0,50)}))
+                .filter(e => e.value || e.text || e.testid).slice(0, 40)""")
+            import json as _json
+            (self.directory / f"{self.step:02d}-controls.json").write_text(
+                _json.dumps(found, indent=1), encoding="utf-8")
+        except Exception as error:  # noqa: BLE001
+            print(f"[TRACE] controls not captured: {str(error)[:80]}")
+
+
 def cart_writes_enabled() -> bool:
     """Cart writes can be switched off without changing code."""
     return os.getenv("AMAZON_ENABLE_CART", "true").strip().casefold() != "false"
@@ -964,8 +1029,19 @@ CHECKOUT_CONTINUE_SELECTOR = (
 # required to reach the review page. The accept control must never be clicked: it
 # enrols the user in a paid subscription that they did not ask for.
 PRIME_DECLINE_TEXT = re.compile(r"^\s*No thanks\s*$", re.IGNORECASE)
+# Nothing matching this may ever be clicked during checkout. "Add to cart" is here
+# because Amazon's "Need anything else?" interstitial is a wall of add-on carousels:
+# every suggested product carries its own Add to cart button, and pressing one would
+# put a product the user never asked for into the order they are about to place.
 NEVER_CLICK = re.compile(
-    r"get free prime|free trial|sign up for prime|start your free trial|join prime|buy now",
+    r"get free prime|free trial|sign up for prime|start your free trial|join prime|"
+    r"buy now|add to cart|add both to cart|subscribe",
+    re.IGNORECASE,
+)
+# The way past an interstitial. Matched on the whole label so "Continue to checkout"
+# cannot be confused with an "Add to cart" sitting beside it.
+CHECKOUT_ADVANCE_TEXT = re.compile(
+    r"^\s*(?:Continue to checkout|Proceed to checkout|Continue|No thanks)\s*$",
     re.IGNORECASE,
 )
 MAX_CHECKOUT_STEPS = 6
@@ -1156,11 +1232,14 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
     # checkout cleanly in a visible browser, while a headless one is redirected to
     # /ap/signin. The session is genuinely authenticated either way — this is a real
     # browser rather than a hidden one, not a disguised one.
+    trace = _CheckoutTrace()
+    _audit(f"ATTEMPT trace={trace.directory}")
     async with _persistent_browser_context(headless=False) as context:
         page = await context.new_page()
         try:
             await page.goto(CART_URL, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(2_000)
+            await trace.record(page, "cart", ceiling=ceiling)
 
             subtotal = _amount(await _text_or_none(page.locator(CART_SUBTOTAL_SELECTOR).first))
             if subtotal is None:
@@ -1178,9 +1257,11 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
             if not await proceed.count():
                 _audit("REFUSED no-proceed-control")
                 return OrderResult(False, detail="Amazon showed no checkout button on the cart.")
+            await trace.record(page, "proceeding", subtotal=subtotal)
             await proceed.click()
             await page.wait_for_load_state("domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(4_000)
+            await trace.record(page, "after-proceed")
 
             if SIGN_IN_URL.search(page.url):
                 _audit("BLOCKED sign-in-required")
@@ -1197,9 +1278,12 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
             button = None
             for _ in range(MAX_CHECKOUT_STEPS):
                 await page.wait_for_timeout(2_500)
+                await trace.record(page, "pipeline-step")
+                await trace.controls(page)
                 found = await _enabled_order_button(page)
                 if found is not None:
                     button = found
+                    await trace.record(page, "order-button-found")
                     break
 
                 # Amazon blocks the step until the card is verified, which needs the
@@ -1213,18 +1297,31 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
                         detail="Amazon wants your card verified before it will accept this order.",
                     )
 
-                decline = page.get_by_text(PRIME_DECLINE_TEXT).first
-                if await decline.count():
-                    label = (await decline.inner_text() or "").strip()
+                # An interstitial: the Prime offer, or the "Need anything else?"
+                # add-on carousel. Both are passed by their own worded control.
+                advanced = False
+                for candidate in (PRIME_DECLINE_TEXT, CHECKOUT_ADVANCE_TEXT):
+                    control = page.get_by_text(candidate).first
+                    if not await control.count():
+                        continue
+                    label = ((await control.inner_text()) or "").strip()
                     if NEVER_CLICK.search(label):
                         _audit(f"REFUSED would-have-clicked {label!r}")
-                        return OrderResult(False, detail="Refusing to accept a paid Amazon offer.")
-                    await _click_step(page, decline)
+                        return OrderResult(
+                            False,
+                            detail=f"Refusing to click {label!r} during checkout.",
+                        )
+                    _audit(f"STEP clicked {label[:40]!r}")
+                    if await _click_step(page, control):
+                        advanced = True
+                        break
+                if advanced:
                     continue
 
                 chosen = await _choose_free_fastest_delivery(page)
                 if chosen:
                     _audit(f"DELIVERY selected free/fastest: {chosen}")
+                    await trace.record(page, "delivery-chosen", option=chosen)
 
                 advance = page.locator(CHECKOUT_CONTINUE_SELECTOR).first
                 if await advance.count():
@@ -1259,9 +1356,11 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
                 )
 
             _audit(f"PLACING subtotal={subtotal} stated_total={stated} ceiling={ceiling}")
+            await trace.record(page, "about-to-place", subtotal=subtotal, stated_total=stated)
             await button.click()
             await page.wait_for_load_state("domcontentloaded", timeout=45_000)
             await page.wait_for_timeout(4_000)
+            await trace.record(page, "after-place")
 
             after = " ".join((await page.locator("body").inner_text()).split())
             if DECLINE_TEXT.search(after):
@@ -1281,6 +1380,8 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
                     order_url="https://www.amazon.com/gp/css/order-history",
                     detail=None,
                 )
+            await trace.record(page, "unconfirmed")
+            await trace.controls(page)
             _audit("UNCONFIRMED no-confirmation-page")
             return OrderResult(
                 False,

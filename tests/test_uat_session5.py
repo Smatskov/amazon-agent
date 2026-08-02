@@ -1053,3 +1053,34 @@ def test_the_free_delivery_matcher_ignores_a_priced_option():
     assert amazon.FREE_DELIVERY.search("FREE Delivery Wednesday, August 5")
     assert amazon.PAID_DELIVERY.search("$6.99 - Tuesday, August 4")
     assert not amazon.PAID_DELIVERY.search("FREE Delivery Wednesday, August 5")
+
+
+# --------------------------------------------------------------------------
+# The "Need anything else?" add-on carousel (captured live, 2026-08-02)
+# --------------------------------------------------------------------------
+
+def test_the_add_on_carousel_is_passed_by_continue_to_checkout():
+    """ISSUE-058. A live order attempt stalled on Amazon's "Need anything else?"
+    interstitial at /checkout/byg/. The way past it is the "Continue to checkout"
+    button; the pipeline recognised nothing on the page and gave up."""
+    assert amazon.CHECKOUT_ADVANCE_TEXT.match("Continue to checkout")
+    assert amazon.CHECKOUT_ADVANCE_TEXT.match("Proceed to checkout")
+    assert amazon.CHECKOUT_ADVANCE_TEXT.match("No thanks")
+
+
+@pytest.mark.parametrize("label", [
+    "Add to cart", "Add both to cart", "Buy now", "Subscribe & Save",
+    "Get FREE Prime Delivery with Prime", "Start your free trial",
+])
+def test_nothing_that_adds_a_product_or_a_subscription_is_ever_clicked(label):
+    """That interstitial is a wall of add-on carousels: every suggested product has
+    its own Add to cart button. Pressing one would put a product the user never asked
+    for into the order they are about to place."""
+    assert amazon.NEVER_CLICK.search(label), f"{label!r} must be refused"
+    assert not amazon.CHECKOUT_ADVANCE_TEXT.match(label), f"{label!r} must not advance"
+
+
+def test_an_advance_label_is_matched_whole_not_by_substring():
+    """"Continue to checkout" sits inches from "Add to cart" on the same page."""
+    assert not amazon.CHECKOUT_ADVANCE_TEXT.match("Continue shopping and add to cart")
+    assert not amazon.CHECKOUT_ADVANCE_TEXT.match("No thanks, add this instead")

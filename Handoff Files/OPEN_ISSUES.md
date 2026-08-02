@@ -629,3 +629,40 @@ Amazon before ordering.
 
 Unchanged from session 5. Space live diagnosis out; a burst of page loads returned one
 bot-check page.
+
+### ISSUE-058 — A live order stalled on the "Need anything else?" carousel — **FIXED**
+
+**Seen (2026-08-02, first real order attempt):** the pipeline reached
+`/checkout/byg/…?tangoIngressUrl=…`, titled **"Need anything else?"**, recognised
+nothing on it, looped its six steps in ~20 seconds and returned
+`REFUSED no-place-order-control`. Nothing was bought — the safe failure worked.
+
+**Root cause:** an interstitial not previously seen. It is an add-on carousel
+("Frequently bought with items in your cart", "Don't forget these essentials"), and
+the way past it is a **"Continue to checkout"** button in the top-right corner. The
+captured controls were all hidden add-to-cart forms for the suggested products, which
+is why the earlier selector sweep found nothing usable.
+
+**Fix:** `CHECKOUT_ADVANCE_TEXT` matches "Continue to checkout" / "Proceed to
+checkout" / "Continue" / "No thanks" on the whole label, and the pipeline tries it
+alongside the Prime decline.
+
+**Second, larger risk found in the same screenshot:** that page is a wall of
+**"Add to cart"** buttons, one per suggested product. An automation pressing the most
+prominent-looking control would have added Ziploc bags or aluminium foil to the order
+about to be placed. `NEVER_CLICK` now refuses `add to cart`, `add both to cart`,
+`subscribe`, `buy now` and every Prime signup wording, and the advance label is matched
+whole so "Continue to checkout" can never be confused with an "Add to cart" beside it.
+
+### ISSUE-059 — Ordering always opens a visible browser window — **BY DESIGN, not yet optional**
+
+Searches, cart reads and cart writes remain headless: no window appears during ordinary
+use. **`place_order()` is different — it forces `headless=False` every time, including
+in production.** That is not a leftover from testing: a headless browser is redirected
+to `/ap/signin` at checkout while a visible one is not (ADR-063), so the window is
+currently what makes ordering work at all. Only two code paths force a window:
+`place_order()` and `open_profile_for_manual_sign_in()`.
+
+Worth revisiting: whether a non-headless-but-offscreen mode, or a separate virtual
+display, gives the same result without a window appearing on the user's desktop. Not
+attempted yet.

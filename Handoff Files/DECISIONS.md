@@ -2179,3 +2179,46 @@ Checkout writes the list into the real cart (ADR-059). Removal only ever touched
 agent's own copy, so an item the user had just deleted stayed in the Amazon cart and
 would still have been bought. The list and the cart have to mean the same thing once
 checkout has run.
+
+---
+
+## ADR-068 — "I Don't Know" Is a First-Class Order Outcome
+
+Status: Accepted and implemented
+
+Decision:
+
+An order attempt has four outcomes, not two: placed, declined, blocked (sign-in, card
+verification, ceiling), and **unknown**. Unknown has its own reply that asserts nothing
+about whether money moved, and before it can be reported the agent must consult
+Amazon's own order list.
+
+Context:
+
+The first order that actually succeeded was reported to the user as
+"❌ THE ORDER DID NOT GO THROUGH … Nothing was bought and nothing was charged." The
+order existed, was charged $12.61, and shipped. Two defects combined: a 3-D Secure
+"Verify payment" page after the order button was read as a terminal failure, and the
+failure screen asserted "nothing was bought" for every non-success including the case
+where the outcome was undetermined.
+
+Reasoning:
+
+- Every other failure path in this build fails closed — it refuses and says so. This
+  one failed *open*: it made a confident negative claim from an absence of evidence.
+  Absence of a confirmation page is not evidence of absence of an order.
+- The authoritative record of whether an order exists is Amazon's order list, not
+  whichever page the browser happened to be showing when the poll expired. Consulting
+  it turns "I don't know" from a verdict into a question that usually gets answered.
+- Where the two errors differ in cost they are not symmetric. Telling a user an order
+  failed when it succeeded invites them to order again and buy twice; telling them the
+  outcome is uncertain costs them one glance at their orders page.
+
+Consequences:
+
+- `_await_order_outcome()` waits through payment authorisation for up to 45 seconds,
+  polling for a confirmation, a decline, or an order number.
+- `find_recent_order()` matches a just-placed order by total before any unknown result
+  is returned.
+- The unknown screen tells the user explicitly not to assume failure and to check
+  before retrying, because a retry is what turns this into a double purchase.

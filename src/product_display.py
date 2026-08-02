@@ -400,7 +400,7 @@ def present_order_placed(
 def present_order_failed(
     summary, options: list[MenuOption], detail: str | None, *,
     needs_sign_in: bool = False, declined: bool = False,
-    needs_card_verification: bool = False,
+    needs_card_verification: bool = False, unknown: bool = False,
 ) -> str:
     """The order did not happen, and the list is untouched.
 
@@ -408,6 +408,22 @@ def present_order_failed(
     nothing to act on. The list is stated as intact so nobody re-adds items they
     still have.
     """
+    if unknown:
+        # Never assert the outcome here. A placed order was once reported as "nothing
+        # was bought and nothing was charged" because a payment-authorisation page was
+        # read as a failure; the user was told the opposite of the truth about their
+        # own money.
+        return "\n\n".join(block for block in [
+            "❓ <b>I COULD NOT TELL WHETHER THE ORDER WENT THROUGH</b>",
+            f"<i>{text(detail)}</i>" if detail else "",
+            "<b>Do not assume it failed.</b> I clicked Place Your Order and Amazon did "
+            "not show me a confirmation, so the order may or may not exist. "
+            "<b>Check Your Orders on Amazon before trying again</b> — ordering a second "
+            "time could buy the same thing twice.",
+            "Your list is unchanged so nothing is lost either way.",
+            menu.render(options, heading="What next?"),
+        ] if block)
+
     if needs_card_verification:
         headline = "💳 <b>AMAZON WANTS YOUR CARD VERIFIED — NOTHING WAS ORDERED</b>"
         guidance = (

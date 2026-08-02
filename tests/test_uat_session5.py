@@ -1084,3 +1084,60 @@ def test_an_advance_label_is_matched_whole_not_by_substring():
     """"Continue to checkout" sits inches from "Add to cart" on the same page."""
     assert not amazon.CHECKOUT_ADVANCE_TEXT.match("Continue shopping and add to cart")
     assert not amazon.CHECKOUT_ADVANCE_TEXT.match("No thanks, add this instead")
+
+
+# --------------------------------------------------------------------------
+# ISSUE-060: a placed order was reported as "nothing was bought"
+# --------------------------------------------------------------------------
+
+def test_an_unknown_outcome_never_claims_nothing_was_bought(paths, monkeypatch):
+    """The worst thing this system can say, and it said it. A 3-D Secure page after
+    the order button was read as a failure, so a real $12.61 order that shipped was
+    reported as "Nothing was bought and nothing was charged"."""
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        False, unknown=True,
+        detail="Amazon never showed a confirmation and no matching order has appeared.")))
+
+    reply = _run("1", paths)
+
+    assert "COULD NOT TELL" in reply
+    assert "Do not assume it failed" in reply
+    assert "Check Your Orders" in reply
+    assert "nothing was charged" not in reply.casefold()
+    assert "nothing was bought" not in reply.casefold()
+
+
+def test_the_payment_authorization_step_is_recognised():
+    """Live: after the order button Amazon showed "Verify payment" at /cpe/executions,
+    a 3-D Secure step that resolves by itself and completes the order."""
+    for text in ["https://www.amazon.com/cpe/executions?pageType=CPEFront",
+                 "Verify payment", "Authorize Payment Method"]:
+        assert amazon.PAYMENT_AUTHORIZATION.search(text), f"{text!r} must be recognised"
+    assert not amazon.PAYMENT_AUTHORIZATION.search("Place Your Order - Amazon Checkout")
+
+
+def test_a_confirmed_order_is_still_reported_as_placed(paths, monkeypatch):
+    """The fix must not make success harder to report than failure."""
+    _at_the_order_screen(paths, monkeypatch)
+    monkeypatch.setattr(agent.amazon, "place_order", AsyncMock(return_value=amazon.OrderResult(
+        True, order_id="112-3910624-2541021",
+        order_url="https://www.amazon.com/gp/css/order-history")))
+
+    reply = _run("1", paths)
+
+    assert "ORDER PLACED" in reply
+    assert "112-3910624-2541021" in reply
+    assert workflow_store.get_active_workflow(USER, paths[1]) in (None,) or \
+        workflow_store.get_workflow(USER, paths[1]).cart == []
+
+
+def test_order_history_is_the_last_word_on_whether_an_order_exists():
+    """A page that never confirmed is not evidence of failure; the order list is."""
+    import inspect
+    source = inspect.getsource(amazon.place_order)
+
+    assert "find_recent_order" in source, "an unconfirmed outcome must check the order list"
+    assert source.index("find_recent_order") < source.index("unknown=True"), (
+        "the order list must be consulted before reporting an unknown outcome"
+    )

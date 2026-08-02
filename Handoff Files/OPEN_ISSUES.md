@@ -666,3 +666,45 @@ currently what makes ordering work at all. Only two code paths force a window:
 Worth revisiting: whether a non-headless-but-offscreen mode, or a separate virtual
 display, gives the same result without a window appearing on the user's desktop. Not
 attempted yet.
+
+### ISSUE-060 — A placed order was reported as "nothing was bought" — **FIXED**
+
+**The worst failure this system can produce, and it happened on the first successful
+order.**
+
+**Seen (2026-08-02, order 112-3910624-2541021, $12.61):** the pipeline worked — it
+cleared the add-on carousel, reached `/checkout/.../spc`, found the order control, and
+clicked it (`PLACING subtotal=11.9 stated_total=12.61`). Amazon then showed
+**"Verify payment"** at `/cpe/executions?...pageType=CPEFront` — a 3-D Secure step
+from the card issuer. The code read "no confirmation page" as "no order" and told the
+user:
+
+> ❌ THE ORDER DID NOT GO THROUGH … Nothing was bought and nothing was charged.
+
+The order had in fact been placed and shipped. Verified against order history:
+`ORDER PLACED August 2, 2026 · TOTAL $12.61 · Arriving Tuesday`.
+
+**Two independent defects:**
+
+1. **A payment-authorisation page was treated as a terminal failure.** It is an
+   intermediate step that resolves by itself. `_await_order_outcome()` now waits
+   through it for up to 45 seconds, polling for a confirmation, a decline, or a real
+   order number.
+2. **An unknown outcome asserted a known one.** The failure screen's guidance said
+   "Nothing was bought and nothing was charged" for *every* non-success, including the
+   case where the outcome was explicitly undetermined. The user was told the opposite
+   of the truth about their own money.
+
+**Fixes:**
+
+- `OrderResult.unknown` is a distinct outcome from a failure, with its own screen:
+  "I COULD NOT TELL WHETHER THE ORDER WENT THROUGH … Do not assume it failed … check
+  Your Orders before trying again — ordering a second time could buy the same thing
+  twice." It never claims nothing was bought.
+- Before reporting an unknown outcome at all, `find_recent_order()` reads Amazon's own
+  order list and matches on the total. The order list is the last word on whether an
+  order exists; whichever page the browser happened to be showing is not.
+
+**Lesson for the build:** every other failure path in this system was written to fail
+closed. This one failed *open* — it made a confident negative claim from an absence of
+evidence. "I don't know" has to be a first-class outcome anywhere money is involved.

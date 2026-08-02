@@ -1072,6 +1072,16 @@ DECLINE_TEXT = re.compile(
     re.IGNORECASE,
 )
 SIGN_IN_URL = re.compile(r"/ap/signin|/ap/cvf|forgotpassword", re.IGNORECASE)
+# After the order button, the card issuer can interpose a 3-D Secure authorisation
+# ("Verify payment", /cpe/executions). It resolves on its own and the order completes,
+# so it is a step to wait through — not a failure, and never a reason to say nothing
+# was bought.
+PAYMENT_AUTHORIZATION = re.compile(
+    r"/cpe/executions|CPEFront|verify payment|authorize payment|approve.{0,12}payment",
+    re.IGNORECASE,
+)
+ORDER_HISTORY_URL = "https://www.amazon.com/gp/css/order-history"
+POST_ORDER_SETTLE_SECONDS = 45
 
 
 @dataclass(frozen=True, slots=True)
@@ -1085,6 +1095,9 @@ class OrderResult:
     needs_sign_in: bool = False
     declined: bool = False
     needs_card_verification: bool = False
+    # The outcome could not be established. Distinct from a failure: it must never be
+    # reported as "nothing was bought".
+    unknown: bool = False
 
 
 async def _choose_free_fastest_delivery(page) -> str | None:
@@ -1157,6 +1170,68 @@ def _delivery_days_from_text(text: str) -> int | None:
 DELIVERY_PARTS_FALLBACK = re.compile(
     r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2})", re.IGNORECASE
 )
+
+
+async def _await_order_outcome(page, trace=None) -> tuple[str | None, bool]:
+    """Wait out any payment-authorisation step and report (order_id, confirmed).
+
+    Amazon's confirmation does not always arrive on the next page load: the issuer can
+    interpose a 3-D Secure step that resolves by itself moments later. Treating that
+    intermediate page as a failure is how a placed order got reported as "nothing was
+    bought and nothing was charged" — the single worst thing this can say.
+    """
+    deadline = perf_counter() + POST_ORDER_SETTLE_SECONDS
+    while perf_counter() < deadline:
+        try:
+            body = " ".join((await page.locator("body").inner_text()).split())
+        except Exception:  # noqa: BLE001 - a navigating page is not a verdict
+            await page.wait_for_timeout(2_000)
+            continue
+
+        found = ORDER_ID.search(body)
+        if ORDER_CONFIRMATION_URL.search(page.url) or found:
+            return (found.group(1) if found else None), True
+        if DECLINE_TEXT.search(body):
+            return None, False
+        if PAYMENT_AUTHORIZATION.search(page.url) or PAYMENT_AUTHORIZATION.search(body):
+            if trace is not None:
+                await trace.record(page, "authorizing-payment")
+            await page.wait_for_timeout(5_000)
+            continue
+        await page.wait_for_timeout(3_000)
+    return None, False
+
+
+async def find_recent_order(expected_total: float | None = None) -> tuple[str, str] | None:
+    """Read order history for an order that has just been placed.
+
+    The last word on whether an order exists belongs to Amazon's own order list, not to
+    whichever page the browser happened to be showing. This is what makes "I don't know"
+    a temporary state rather than something the user is told.
+    """
+    try:
+        async with _persistent_browser_context() as context:
+            page = await context.new_page()
+            try:
+                await page.goto(ORDER_HISTORY_URL, wait_until="domcontentloaded", timeout=30_000)
+                await page.wait_for_timeout(3_500)
+                body = " ".join((await page.locator("body").inner_text()).split())
+                match = re.search(
+                    r"ORDER PLACED\s+(\w+ \d+, \d{4})\s+TOTAL\s+\$([\d,]+\.\d{2}).{0,80}?"
+                    r"ORDER #\s*(\d{3}-\d{7}-\d{7})",
+                    body, re.IGNORECASE,
+                )
+                if not match:
+                    return None
+                total = float(match.group(2).replace(",", ""))
+                if expected_total is not None and abs(total - expected_total) > 0.5:
+                    return None
+                return match.group(3), f"${total:.2f}"
+            finally:
+                await page.close()
+    except Exception as error:  # noqa: BLE001
+        print(f"[AMAZON] could not read order history: {error}")
+        return None
 
 
 async def _enabled_order_button(page):
@@ -1362,31 +1437,41 @@ async def place_order(*, max_total: float | None = None) -> OrderResult:
             await page.wait_for_timeout(4_000)
             await trace.record(page, "after-place")
 
+            # Amazon's confirmation does not always arrive on the next page load: the
+            # card issuer can interpose a 3-D Secure step that resolves by itself and
+            # completes the order. Treating that page as a failure is how a real order
+            # was reported as "nothing was bought and nothing was charged".
+            order_id, confirmed = await _await_order_outcome(page, trace)
+            await trace.record(page, "outcome", order_id=order_id, confirmed=confirmed)
+
+            if confirmed:
+                _audit(f"PLACED order_id={order_id}")
+                return OrderResult(True, order_id=order_id, order_url=ORDER_HISTORY_URL)
+
             after = " ".join((await page.locator("body").inner_text()).split())
             if DECLINE_TEXT.search(after):
                 _audit("FAILED payment-declined")
                 return OrderResult(
-                    False,
-                    declined=True,
+                    False, declined=True,
                     detail="Amazon rejected the payment method. Nothing was ordered.",
                 )
 
-            order_id = (ORDER_ID.search(after) or [None, None])[1]
-            if ORDER_CONFIRMATION_URL.search(page.url) or order_id:
-                _audit(f"PLACED order_id={order_id}")
-                return OrderResult(
-                    True,
-                    order_id=order_id,
-                    order_url="https://www.amazon.com/gp/css/order-history",
-                    detail=None,
-                )
-            await trace.record(page, "unconfirmed")
+            # A page that never confirmed is not evidence the order failed. Amazon's
+            # own order list is the last word, so it is consulted before the user is
+            # told anything at all.
             await trace.controls(page)
-            _audit("UNCONFIRMED no-confirmation-page")
+            _audit("UNCONFIRMED checking-order-history")
+            recent = await find_recent_order(stated if stated is not None else subtotal)
+            if recent:
+                _audit(f"PLACED confirmed-via-history order_id={recent[0]}")
+                return OrderResult(True, order_id=recent[0], order_url=ORDER_HISTORY_URL)
+
+            _audit("UNKNOWN no-confirmation-and-no-matching-order")
             return OrderResult(
                 False,
-                detail="Amazon did not show a confirmation, so I cannot tell you the order "
-                       "went through. Check your Amazon orders before trying again.",
+                unknown=True,
+                detail="Amazon never showed a confirmation and no matching order has "
+                       "appeared in your order history yet.",
             )
         except Exception as error:  # noqa: BLE001 - the reply must never be an exception
             _audit(f"ERROR {str(error)[:120]}")

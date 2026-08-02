@@ -726,6 +726,7 @@ async def _place_order(
             summary, options, result.detail,
             needs_sign_in=result.needs_sign_in, declined=result.declined,
             needs_card_verification=result.needs_card_verification,
+            unknown=result.unknown,
         )
 
     workflow.cart = []

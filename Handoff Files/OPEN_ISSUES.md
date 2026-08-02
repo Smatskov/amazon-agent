@@ -1,3 +1,37 @@
+# Open Issues — current status index
+
+This file is append-only, so an issue fixed later still shows its original **OPEN**
+entry further down. **This table is the authority on current status;** the entries
+below are the history of how each was found and reasoned about.
+
+| Issue | Status | What it was |
+| --- | --- | --- |
+| ISSUE-060 | **FIXED** | A placed order was reported as "nothing was bought" |
+| ISSUE-059 | **FIXED** | Add-on carousel blocked checkout |
+| ISSUE-057 | **FIXED** | Non-Prime products were suggested |
+| ISSUE-056 | **FIXED** | Card verification surfaced as a 30s timeout |
+| ISSUE-055 | **FIXED** | Prime upsell could have been accepted mid-checkout |
+| ISSUE-053 | **FIXED** | Variation options were unsorted |
+| ISSUE-051 | **WONTFIX (blocked)** | Address book is behind an Amazon re-auth wall |
+| ISSUE-050 | **FIXED** | Corrupt quantity payload could raise |
+| ISSUE-049 | **FIXED** | Cart writes opened a browser before validating URLs |
+| ISSUE-048 | **FIXED** | A stored menu could make a workflow unreadable |
+| ISSUE-043 | **FIXED** | A variation listing could not be added |
+| ISSUE-035 | **OPEN** | No evidence source could justify an auto-add |
+| ISSUE-034 | **WONTFIX** | A stated pack size is not enforced (user's call) |
+| ISSUE-033 | **FIXED** | "No Add to Cart control" for an addable item |
+| ISSUE-023 | **FIXED** | Quantity could not be changed |
+| ISSUE-017 | **FIXED** | Removing an item did not reach the real Amazon cart |
+| ISSUE-006 | **FIXED** | Brand-only titles |
+| ISSUE-052 | **OPEN** | Rapid automated probing trips an Amazon interstitial |
+| ISSUE-061 | **OPEN** | No duplicate-order prevention; a retry can buy the same thing twice |
+
+Still open and worth doing next: **ISSUE-061**, **ISSUE-035**, **ISSUE-051**,
+**ISSUE-052**, and observing the free/fastest delivery selection actually fire
+(ADR-066).
+
+---
+
 # Open Issues
 
 > **UAT session 4 (2026-07-31) closed all five reported failures** by removing the
@@ -708,3 +742,23 @@ The order had in fact been placed and shipped. Verified against order history:
 **Lesson for the build:** every other failure path in this system was written to fail
 closed. This one failed *open* — it made a confident negative claim from an absence of
 evidence. "I don't know" has to be a first-class outcome anywhere money is involved.
+
+
+### ISSUE-061 — Nothing prevents ordering the same thing twice — **OPEN**
+
+`AGENTS.md` requires "price limits, duplicate prevention, audit logs, authorization,
+and confirmation rules" before financial actions. Four of the five exist. **Duplicate
+prevention does not.**
+
+ISSUE-060 made this concrete: a placed order was reported as a failure, and the only
+thing standing between the user and a second $12.61 charge was them reading the reply
+carefully. The fix stops the false report and now warns "ordering a second time could
+buy the same thing twice" — but that is advice, not a control.
+
+What a control would look like: before submitting, check whether an order with the
+same items and total was placed in the last few minutes (`find_recent_order()` already
+reads the order list), and refuse rather than submit. The audit log already records
+every `PLACING` line with its subtotal and total, so a local check is possible without
+touching Amazon at all.
+
+Worth doing before ordering is used regularly rather than tested.

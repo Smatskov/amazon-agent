@@ -108,14 +108,20 @@ The flow is: search → list → checkout (writes your real Amazon cart) → **P
   grew between those two reads is refused rather than paid.
 - **An audit log.** Every attempt — refused, blocked, placed, declined — is appended to
   `AMAZON_ORDER_AUDIT_LOG` with a timestamp.
-- **No password, ever.** Amazon requires a fresh sign-in before checkout
-  (`max_auth_age=900`). This application never authenticates; that redirect is reported to
-  you to resolve, never worked around.
+- **No password or card number, ever.** Where Amazon demands one — an expired session, or
+  a card it wants verified — the wall is reported to you to resolve, never worked around.
+- **No paid offer is ever accepted.** Amazon injects a Prime free-trial page mid-checkout
+  for non-members whose prominent button enrols you in a subscription. Only "No thanks" is
+  clickable.
 - **No language model can write to you**, so none can claim an order was placed. A test
   asserts no module outside `intent_classifier` even mentions `generate_response`.
 
-Ordering is also reported honestly: if Amazon shows no confirmation page, the reply says the
-outcome is unknown and to check your orders — it is never reported as success.
+Ordering is reported honestly in both directions. If Amazon shows no confirmation page the
+agent waits out any payment-authorisation step, then checks your Amazon order list before
+saying anything. If it still cannot tell, it says exactly that — it never reports success it
+cannot see, and, just as importantly, **never claims nothing was bought when it does not
+know**. That second half was learned the hard way: a real $12.61 order was once reported as
+"nothing was bought and nothing was charged" (ISSUE-060).
 
 Cart writes click `#add-to-cart-button` by exact id, so the control can never resolve to
 "Buy Now" beside it, and success is read from Amazon's own cart badge rather than assumed.

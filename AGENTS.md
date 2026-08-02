@@ -4,7 +4,7 @@ Build a production-quality personal AI purchasing agent controlled through Teleg
 
 `Telegram request → agent reasoning → memory/tools → Amazon workflow → confirmation through Telegram`
 
-Amazon purchasing functionality is not implemented yet. Introduce it incrementally, with safeguards at every financially consequential step.
+Introduce purchasing incrementally, with safeguards at every financially consequential step.
 
 # Source of Truth
 
@@ -77,12 +77,11 @@ Before financial actions, require price limits, duplicate prevention, audit logs
 - Do not make broad architectural changes or improve/refactor unrelated code.
 - Do not refactor working code unless requested or required.
 - Preserve existing behavior unless the task intentionally changes it.
-- Stop after completing the requested checkpoint; do not begin later roadmap stages without being asked.
 - Explain meaningful architectural changes in plain English: what changes, why, the problem solved, and where the pattern appears in real software engineering. Do not over-explain trivial commands or repetitive edits. When execution speed is requested, minimize explanation while still flagging major risks.
 
 # Engineering Workflow
 
-Follow this sequence: **Understand → Plan → Implement → Verify → Document → Stop**. Do not skip directly from reading a task to editing code.
+Follow this sequence: **Understand → Plan → Implement → Verify → Document**. Do not skip directly from reading a task to editing code.
 
 # Scope Control
 
